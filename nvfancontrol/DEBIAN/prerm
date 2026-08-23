@@ -1,0 +1,72 @@
+#!/bin/sh
+
+set -eu
+
+PATH=/usr/sbin:/usr/bin:/sbin:/bin
+
+module='nvfancontrol'
+module_version='1.0.0'
+source_dir="/usr/src/$module"
+dkms_source_link="/usr/src/$module-$module_version"
+state_dir='/var/lib/nvfancontrol'
+manual_state_dir="$state_dir/manual-kernels"
+
+remove_manual_modules() {
+    [ -d "$manual_state_dir" ] || return 0
+
+    for marker in "$manual_state_dir"/*; do
+        [ -f "$marker" ] || continue
+        kernel_release=${marker##*/}
+        case "$kernel_release" in
+            ''|*[!A-Za-z0-9._+-]*)
+                echo "nvfancontrol: ignoring invalid manual kernel marker: $marker" >&2
+                continue
+                ;;
+        esac
+
+        module_file="/lib/modules/$kernel_release/updates/$module.ko"
+        if [ -e "$module_file" ]; then
+            echo "nvfancontrol: removing non-DKMS module $module_file"
+            rm -f -- "$module_file"
+        fi
+        rm -f -- "$marker"
+        if [ -d "/lib/modules/$kernel_release" ]; then
+            depmod -a "$kernel_release" || true
+        fi
+    done
+
+    rmdir "$manual_state_dir" 2>/dev/null || true
+    rmdir "$state_dir" 2>/dev/null || true
+}
+
+case "${1:-}" in
+    remove|upgrade|deconfigure)
+        exec 9>/run/lock/nvfancontrol.lock
+        flock 9
+
+        if grep -q "^${module} " /proc/modules 2>/dev/null; then
+            echo 'nvfancontrol: unloading the module before package removal/upgrade'
+            rmmod "$module"
+            echo 'nvfancontrol: module unload does not change the EC override value'
+        fi
+
+        if [ -e "/var/lib/dkms/$module/$module_version" ]; then
+            if command -v dkms >/dev/null 2>&1; then
+                echo "nvfancontrol: removing DKMS registration $module/$module_version"
+                dkms remove -m "$module" -v "$module_version" --all
+            else
+                echo "nvfancontrol: removing stale DKMS registration without the dkms command"
+                rm -rf -- "/var/lib/dkms/$module/$module_version"
+            fi
+        fi
+
+        remove_manual_modules
+
+        if [ -L "$dkms_source_link" ] &&
+           [ "$(readlink "$dkms_source_link")" = "$source_dir" ]; then
+            rm -f -- "$dkms_source_link"
+        fi
+        ;;
+esac
+
+exit 0

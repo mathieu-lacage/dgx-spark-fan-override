@@ -1,0 +1,165 @@
+#!/bin/sh
+
+set -eu
+
+PATH=/usr/sbin:/usr/bin:/sbin:/bin
+
+case "${1:-}" in
+    configure)
+        ;;
+    *)
+        exit 0
+        ;;
+esac
+
+module='nvfancontrol'
+module_version='1.0.0'
+source_dir="/usr/src/$module"
+dkms_source_link="/usr/src/$module-$module_version"
+common_postinst='/usr/lib/dkms/common.postinst'
+state_dir='/var/lib/nvfancontrol'
+manual_state_dir="$state_dir/manual-kernels"
+kernel_release="$(uname -r)"
+manual_module="/lib/modules/$kernel_release/updates/$module.ko"
+
+case "$kernel_release" in
+    ''|*[!A-Za-z0-9._+-]*)
+        echo "nvfancontrol: refusing unexpected kernel release: $kernel_release" >&2
+        exit 1
+        ;;
+esac
+
+for file in "$source_dir/Makefile" "$source_dir/nvfancontrol.c" \
+            "$source_dir/dkms.conf"; do
+    if [ ! -r "$file" ]; then
+        echo "nvfancontrol: module source is missing: $file" >&2
+        exit 1
+    fi
+done
+
+verify_module() {
+    module_file=$1
+    expected_kernel=$2
+
+    if [ ! -r "$module_file" ]; then
+        echo "nvfancontrol: compiled module is missing: $module_file" >&2
+        return 1
+    fi
+
+    module_name="$(modinfo -F name "$module_file")"
+    module_vermagic="$(modinfo -F vermagic "$module_file")"
+    if [ "$module_name" != "$module" ]; then
+        echo "nvfancontrol: unexpected module name: $module_name" >&2
+        return 1
+    fi
+    case "$module_vermagic" in
+        "$expected_kernel "*)
+            ;;
+        *)
+            echo "nvfancontrol: module vermagic does not match $expected_kernel: $module_vermagic" >&2
+            return 1
+            ;;
+    esac
+}
+
+remove_current_manual_module() {
+    marker="$manual_state_dir/$kernel_release"
+
+    [ -f "$marker" ] || return 0
+
+    if [ -e "$manual_module" ]; then
+        echo "nvfancontrol: removing superseded non-DKMS module $manual_module"
+        rm -f -- "$manual_module"
+        depmod -a "$kernel_release"
+    fi
+    rm -f -- "$marker"
+    rmdir "$manual_state_dir" 2>/dev/null || true
+    rmdir "$state_dir" 2>/dev/null || true
+}
+
+exec 9>/run/lock/nvfancontrol.lock
+flock 9
+
+if command -v dkms >/dev/null 2>&1 && [ -x "$common_postinst" ]; then
+    # DKMS discovers source as /usr/src/<module>-<version>. Keep the package's
+    # actual source in /usr/src/nvfancontrol and expose only the compatibility
+    # symlink DKMS requires. Never replace an unrelated file or directory.
+    if [ -e "$dkms_source_link" ] || [ -L "$dkms_source_link" ]; then
+        if [ ! -L "$dkms_source_link" ] ||
+           [ "$(readlink "$dkms_source_link")" != "$source_dir" ]; then
+            echo "nvfancontrol: refusing to replace $dkms_source_link" >&2
+            echo "nvfancontrol: remove or relocate that unrelated path, then retry configuration" >&2
+            exit 1
+        fi
+    else
+        ln -s -- "$source_dir" "$dkms_source_link"
+    fi
+
+    echo "nvfancontrol: DKMS detected; registering $module/$module_version"
+    "$common_postinst" "$module" "$module_version" /usr/src '' "${2:-}"
+
+    if [ -r "/lib/modules/$kernel_release/build/Makefile" ] &&
+       [ -d "/lib/modules/$kernel_release/build/include" ]; then
+        dkms_state="$(dkms status -m "$module" -v "$module_version" \
+            -k "$kernel_release" 2>/dev/null || true)"
+        case "$dkms_state" in
+            *': installed'*)
+                ;;
+            *)
+                echo "nvfancontrol: DKMS state for $kernel_release is not installed: $dkms_state" >&2
+                exit 1
+                ;;
+        esac
+
+        remove_current_manual_module
+
+        module_path="$(modinfo -n "$module" 2>/dev/null || true)"
+        verify_module "$module_path" "$kernel_release"
+        echo "nvfancontrol: DKMS module installed for running kernel: $module_path"
+    else
+        echo "nvfancontrol: matching headers for $kernel_release are absent; DKMS registered the source and will build it when headers become available"
+    fi
+else
+    if command -v dkms >/dev/null 2>&1; then
+        echo "nvfancontrol: DKMS command exists but $common_postinst is unavailable; using the normal one-time build"
+    else
+        echo "nvfancontrol: DKMS is not installed; using the normal one-time build"
+    fi
+
+    if [ -L "$dkms_source_link" ] &&
+       [ "$(readlink "$dkms_source_link")" = "$source_dir" ]; then
+        rm -f -- "$dkms_source_link"
+    fi
+
+    if [ ! -r "/lib/modules/$kernel_release/build/Makefile" ] ||
+       [ ! -d "/lib/modules/$kernel_release/build/include" ]; then
+        echo "nvfancontrol: matching headers are required for the normal build: $kernel_release" >&2
+        echo "nvfancontrol: install the matching headers, then run: dpkg --configure nvfancontrol" >&2
+        exit 1
+    fi
+
+    echo "nvfancontrol: compiling for running kernel $kernel_release"
+    cleanup_build_tree() {
+        make -C "$source_dir" KERNELRELEASE="$kernel_release" clean \
+            >/dev/null 2>&1 || true
+    }
+    trap cleanup_build_tree EXIT HUP INT TERM
+    make -C "$source_dir" KERNELRELEASE="$kernel_release" clean
+    make -C "$source_dir" KERNELRELEASE="$kernel_release" all
+    verify_module "$source_dir/$module.ko" "$kernel_release"
+
+    install -d -m 0755 "$(dirname "$manual_module")"
+    install -m 0644 "$source_dir/$module.ko" "$manual_module"
+    depmod -a "$kernel_release"
+    verify_module "$manual_module" "$kernel_release"
+
+    install -d -m 0755 "$manual_state_dir"
+    : > "$manual_state_dir/$kernel_release"
+    cleanup_build_tree
+    trap - EXIT HUP INT TERM
+    echo "nvfancontrol: module installed for running kernel: $manual_module"
+fi
+
+echo "nvfancontrol: use 'sudo nvfancontrol max' or 'sudo nvfancontrol auto'"
+
+exit 0

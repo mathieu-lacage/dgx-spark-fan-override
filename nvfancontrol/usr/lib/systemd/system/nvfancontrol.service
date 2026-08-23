@@ -1,0 +1,10 @@
+[Unit]
+Description=nvfancontrol
+After=auditd.service
+
+[Service]
+ExecStart=/usr/sbin/nvfancontrol max
+Type=simple
+
+[Install]
+WantedBy=multi-user.target

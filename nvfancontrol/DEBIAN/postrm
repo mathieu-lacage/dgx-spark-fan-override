@@ -1,0 +1,22 @@
+#!/bin/sh
+
+set -eu
+
+PATH=/usr/sbin:/usr/bin:/sbin:/bin
+
+module='nvfancontrol'
+module_version='1.0.0'
+source_dir="/usr/src/$module"
+dkms_source_link="/usr/src/$module-$module_version"
+
+case "${1:-}" in
+    remove|purge)
+        rm -rf -- /var/lib/nvfancontrol
+        if [ -L "$dkms_source_link" ] &&
+           [ "$(readlink "$dkms_source_link")" = "$source_dir" ]; then
+            rm -f -- "$dkms_source_link"
+        fi
+        ;;
+esac
+
+exit 0
