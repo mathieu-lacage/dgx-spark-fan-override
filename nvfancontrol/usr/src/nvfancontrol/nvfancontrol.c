@@ -4,16 +4,28 @@
  *
  * Loading the module only binds the verified FF-A partition and creates:
  *
- *   /sys/bus/arm_ffa/devices/arm-ffa-17/fan
+ *   /sys/bus/arm_ffa/devices/arm-ffa-17/fan            (read/write)
+ *   /sys/bus/arm_ffa/devices/arm-ffa-17/fan_caps        (read-only)
+ *   /sys/bus/arm_ffa/devices/arm-ffa-17/fan_telemetry   (read-only)
+ *   /sys/bus/arm_ffa/devices/arm-ffa-17/fan_rpm         (read-only)
  *
- * Writing "max" or "auto" issues one OEM1 command 17 request. Requests are
- * serialized, and the interface remains available for subsequent state changes.
+ * Writing "max" or "auto" to "fan" issues one OEM1 command 17 request
+ * carrying EC thermal-mailbox inner command 5 (set high override slot).
+ * Reading "fan_caps"/"fan_telemetry" issues the same OEM1 command 17
+ * transport carrying EC inner command 1 (capabilities/mode/ranges) or 7
+ * (64-byte live telemetry snapshot), and returns the raw EC reply bytes
+ * as hex text. "fan_rpm" also issues inner command 7 and additionally
+ * decodes the two live fan RPM fields found empirically within that
+ * snapshot (see the comment above fan_rpm_show()). Requests are
+ * serialized, and the interface remains available for subsequent
+ * requests.
  */
 
 #include <linux/arm_ffa.h>
 #include <linux/delay.h>
 #include <linux/device.h>
 #include <linux/errno.h>
+#include <linux/hex.h>
 #include <linux/io.h>
 #include <linux/kernel.h>
 #include <linux/ktime.h>
@@ -34,14 +46,43 @@
 #define ESPI_NS_SHM_SIZE           0x1000U
 #define ESPI_NS_SHM_PROTOCOL_SIZE  32U
 
-#define GENERIC_FRAME_LENGTH       5U
 #define GENERIC_OUTPUT_OFFSET      0U
 #define GENERIC_DATA_OFFSET        0x10U
 #define GENERIC_INPUT_ACCEPTED     3U
 #define GENERIC_OUTPUT_READY       4U
 
-#define THERMAL_OUTER_COMMAND      0x07U
-#define THERMAL_SET_HIGH_OVERRIDE  0x05U
+#define THERMAL_OUTER_COMMAND        0x07U
+#define THERMAL_QUERY_CAPS           0x01U
+#define THERMAL_SET_HIGH_OVERRIDE    0x05U
+#define THERMAL_TELEMETRY_SNAPSHOT   0x07U
+
+#define THERMAL_HEADER_LENGTH         3U
+#define THERMAL_FAN_EXTRA_LENGTH      2U
+#define THERMAL_FAN_REPLY_LENGTH      (THERMAL_HEADER_LENGTH + THERMAL_FAN_EXTRA_LENGTH)
+#define THERMAL_CAPS_REPLY_LENGTH     13U
+#define THERMAL_TELEMETRY_REPLY_LENGTH 67U
+#define THERMAL_MAX_REQUEST_LENGTH    (THERMAL_HEADER_LENGTH + THERMAL_FAN_EXTRA_LENGTH)
+#define THERMAL_MAX_REPLY_LENGTH      THERMAL_TELEMETRY_REPLY_LENGTH
+
+/*
+ * Offsets of the two live fan RPM fields (each little-endian u16) within
+ * the inner-command-7 reply. Not documented anywhere; determined
+ * empirically on an MSI EdgeXpert DGX Spark unit by correlating raw
+ * fan_telemetry reads against forced "max"/"auto" transitions and
+ * sensors(1) temperatures: both fields ramp from 0 to a steady plateau
+ * within ~10s of writing "max" to fan, and ramp smoothly back down over
+ * ~70s after writing "auto", tracking each other closely throughout
+ * (consistent with two matched fan channels). The steady-state "max"
+ * plateau observed (~4332 / ~4444 RPM) is well below the fan0/fan1
+ * ranges the README documents (1260-9000 / 1890-13500), which is
+ * presumably specific to this OEM's fan hardware rather than a decoding
+ * error. Which offset is "fan0" vs "fan1" in the PWM0/TACH0 vs
+ * PWM1/TACH1 sense is inferred from position only (lower offset first)
+ * and has not been independently confirmed.
+ */
+#define THERMAL_TELEMETRY_FAN0_RPM_OFFSET 7U
+#define THERMAL_TELEMETRY_FAN1_RPM_OFFSET 9U
+
 #define TARGET_FULL_RPM            13500U
 #define TARGET_AUTOMATIC           0xffffU
 
@@ -82,14 +123,16 @@ static void restore_shared_page(struct device *dev, u8 *shm,
 		 ESPI_NS_SHM_PROTOCOL_SIZE);
 }
 
-static int submit_fan_request(struct nvfancontrol_state *state, u16 target)
+static int ec_thermal_request(struct nvfancontrol_state *state, u8 inner_cmd,
+			       const u8 *extra, u8 extra_len,
+			       u8 *reply, u8 reply_len)
 {
 	struct ffa_device *fdev = state->fdev;
 	struct ffa_send_direct_data2 msg = {};
 	u8 snapshot[ESPI_NS_SHM_PROTOCOL_SIZE];
 	u8 frame[ESPI_NS_SHM_PROTOCOL_SIZE] = {};
-	u8 request[GENERIC_FRAME_LENGTH];
-	u8 response[GENERIC_FRAME_LENGTH];
+	u8 request[THERMAL_MAX_REQUEST_LENGTH];
+	u8 request_len = THERMAL_HEADER_LENGTH + extra_len;
 	u8 *payload = (u8 *)msg.data;
 	u8 *shm;
 	unsigned long pfn = PHYS_PFN(ESPI_NS_SHM_PA);
@@ -102,6 +145,11 @@ static int submit_fan_request(struct nvfancontrol_state *state, u16 target)
 	s64 elapsed_us;
 	int result;
 	int ret;
+
+	if (WARN_ON(request_len > sizeof(request) ||
+		    reply_len > THERMAL_MAX_REPLY_LENGTH ||
+		    GENERIC_DATA_OFFSET + reply_len > ESPI_NS_SHM_SIZE))
+		return -EINVAL;
 
 	map_memory = pfn_is_map_memory(pfn);
 	if (map_memory)
@@ -139,25 +187,21 @@ static int submit_fan_request(struct nvfancontrol_state *state, u16 target)
 	}
 
 	request[0] = THERMAL_OUTER_COMMAND;
-	request[1] = THERMAL_SET_HIGH_OVERRIDE;
+	request[1] = inner_cmd;
 	request[2] = 0;
-	put_unaligned_le16(target, &request[3]);
+	if (extra_len)
+		memcpy(&request[THERMAL_HEADER_LENGTH], extra, extra_len);
 
-	frame[0] = GENERIC_FRAME_LENGTH;
-	frame[1] = GENERIC_FRAME_LENGTH;
+	frame[0] = request_len;
+	frame[1] = reply_len;
 	frame[2] = GENERIC_OUTPUT_OFFSET;
-	memcpy(&frame[GENERIC_DATA_OFFSET], request, sizeof(request));
+	memcpy(&frame[GENERIC_DATA_OFFSET], request, request_len);
 	memcpy(shm, frame, sizeof(frame));
 	mb();
 
-	if (target == TARGET_FULL_RPM)
-		dev_warn(&fdev->dev,
-			 "starting MAX request: fixed EC frame %*ph\n",
-			 (int)sizeof(request), request);
-	else
-		dev_warn(&fdev->dev,
-			 "starting AUTO request: fixed EC frame %*ph\n",
-			 (int)sizeof(request), request);
+	dev_info(&fdev->dev,
+		 "starting inner-command %#04x request: fixed EC frame %*ph\n",
+		 inner_cmd, (int)request_len, request);
 
 	payload[0] = ESPI_OEM_GENERIC_EMI;
 	start = ktime_get();
@@ -165,7 +209,7 @@ static int submit_fan_request(struct nvfancontrol_state *state, u16 target)
 	elapsed_us = ktime_us_delta(ktime_get(), start);
 	if (ret) {
 		dev_crit(&fdev->dev,
-			 "FF-A TRANSPORT FAILURE: ret=%d elapsed=%lld us; EC override state is unknown\n",
+			 "FF-A TRANSPORT FAILURE: ret=%d elapsed=%lld us; EC state is unknown\n",
 			 ret, elapsed_us);
 		restore_shared_page(&fdev->dev, shm, snapshot, &ret);
 		goto out_unmap;
@@ -184,10 +228,10 @@ static int submit_fan_request(struct nvfancontrol_state *state, u16 target)
 	if (service_status != 0) {
 		if (service_status == 5 && elapsed_us >= ESPI_TIMEOUT_FLOOR_US)
 			dev_crit(&fdev->dev,
-				 "eSPI TIMEOUT: internal mailbox operation timed out; EC override state is unknown\n");
+				 "eSPI TIMEOUT: internal mailbox operation timed out; EC state is unknown\n");
 		else
 			dev_crit(&fdev->dev,
-				 "SERVICE REJECTED: status=%u; EC override state is unknown\n",
+				 "SERVICE REJECTED: status=%u; EC state is unknown\n",
 				 service_status);
 
 		ret = service_status == 10 ? -EBUSY : -EIO;
@@ -204,7 +248,7 @@ static int submit_fan_request(struct nvfancontrol_state *state, u16 target)
 
 	if (READ_ONCE(shm[GENERIC_OUTPUT_READY]) != 1) {
 		dev_crit(&fdev->dev,
-			 "OUTPUT TIMEOUT after %u ms: accepted=%#04x ready=%#04x; EC override state is unknown; shared frame is left intact and no retry is allowed\n",
+			 "OUTPUT TIMEOUT after %u ms: accepted=%#04x ready=%#04x; EC state is unknown; shared frame is left intact and no retry is allowed\n",
 			 REPLY_TIMEOUT_MS,
 			 READ_ONCE(shm[GENERIC_INPUT_ACCEPTED]),
 			 READ_ONCE(shm[GENERIC_OUTPUT_READY]));
@@ -213,30 +257,25 @@ static int submit_fan_request(struct nvfancontrol_state *state, u16 target)
 	}
 
 	mb();
-	memcpy(response, &shm[GENERIC_DATA_OFFSET], sizeof(response));
+	memcpy(reply, &shm[GENERIC_DATA_OFFSET], reply_len);
 	dev_info(&fdev->dev,
 		 "EC reply after <=%u ms: accepted=%#04x ready=%#04x response=%*ph\n",
 		 elapsed, READ_ONCE(shm[GENERIC_INPUT_ACCEPTED]),
 		 READ_ONCE(shm[GENERIC_OUTPUT_READY]),
-		 (int)sizeof(response), response);
+		 (int)reply_len, reply);
 
-	if (memcmp(response, request, sizeof(response)) || response[2] != 0) {
+	if (reply_len < request_len || memcmp(reply, request, request_len)) {
 		dev_crit(&fdev->dev,
-			 "RESPONSE MISMATCH: expected=%*ph observed=%*ph; EC override state is unknown\n",
-			 (int)sizeof(request), request,
-			 (int)sizeof(response), response);
+			 "RESPONSE MISMATCH: expected-prefix=%*ph observed=%*ph; EC state is unknown\n",
+			 (int)request_len, request,
+			 (int)reply_len, reply);
 		result = -EPROTO;
 		restore_shared_page(&fdev->dev, shm, snapshot, &result);
 		ret = result;
 		goto out_unmap;
 	}
 
-	if (target == TARGET_FULL_RPM)
-		dev_warn(&fdev->dev,
-			 "MAX ACKNOWLEDGED: EC accepted high override=13500 RPM; fan0 and fan1 policy outputs saturate at 100%%\n");
-	else
-		dev_warn(&fdev->dev,
-			 "AUTO ACKNOWLEDGED: EC accepted high override=0xffff; automatic thermal curve is restored\n");
+	dev_info(&fdev->dev, "inner-command %#04x ACKNOWLEDGED\n", inner_cmd);
 
 	result = 0;
 	restore_shared_page(&fdev->dev, shm, snapshot, &result);
@@ -245,6 +284,36 @@ static int submit_fan_request(struct nvfancontrol_state *state, u16 target)
 out_unmap:
 	memunmap(shm);
 	return ret;
+}
+
+static int submit_fan_request(struct nvfancontrol_state *state, u16 target)
+{
+	u8 extra[THERMAL_FAN_EXTRA_LENGTH];
+	u8 reply[THERMAL_FAN_REPLY_LENGTH];
+	int ret;
+
+	put_unaligned_le16(target, extra);
+
+	if (target == TARGET_FULL_RPM)
+		dev_warn(&state->fdev->dev, "starting MAX request: target=%u\n",
+			 target);
+	else
+		dev_warn(&state->fdev->dev, "starting AUTO request: target=%#x\n",
+			 target);
+
+	ret = ec_thermal_request(state, THERMAL_SET_HIGH_OVERRIDE, extra,
+				  sizeof(extra), reply, sizeof(reply));
+	if (ret)
+		return ret;
+
+	if (target == TARGET_FULL_RPM)
+		dev_warn(&state->fdev->dev,
+			 "MAX ACKNOWLEDGED: EC accepted high override=13500 RPM; fan0 and fan1 policy outputs saturate at 100%%\n");
+	else
+		dev_warn(&state->fdev->dev,
+			 "AUTO ACKNOWLEDGED: EC accepted high override=0xffff; automatic thermal curve is restored\n");
+
+	return 0;
 }
 
 static ssize_t fan_show(struct device *dev, struct device_attribute *attr,
@@ -312,6 +381,95 @@ static ssize_t fan_store(struct device *dev, struct device_attribute *attr,
 
 static DEVICE_ATTR_RW(fan);
 
+/*
+ * sysfs_emit()'s "%*phN" goes through vsnprintf()'s hex_string(), which
+ * silently caps its output at 64 source bytes. THERMAL_TELEMETRY_REPLY_LENGTH
+ * is 67, so that path would truncate the reply; bin2hex() has no such cap.
+ */
+static ssize_t emit_hex(char *buf, const u8 *data, size_t len)
+{
+	bin2hex(buf, data, len);
+	buf[len * 2] = '\n';
+	buf[len * 2 + 1] = '\0';
+	return len * 2 + 1;
+}
+
+static ssize_t fan_caps_show(struct device *dev, struct device_attribute *attr,
+			      char *buf)
+{
+	struct nvfancontrol_state *state = dev_get_drvdata(dev);
+	u8 reply[THERMAL_CAPS_REPLY_LENGTH];
+	int ret;
+
+	ret = mutex_lock_interruptible(&state->request_lock);
+	if (ret)
+		return ret;
+
+	ret = ec_thermal_request(state, THERMAL_QUERY_CAPS, NULL, 0,
+				  reply, sizeof(reply));
+
+	mutex_unlock(&state->request_lock);
+
+	if (ret)
+		return ret;
+
+	return emit_hex(buf, reply, sizeof(reply));
+}
+
+static DEVICE_ATTR_RO(fan_caps);
+
+static ssize_t fan_telemetry_show(struct device *dev,
+				   struct device_attribute *attr, char *buf)
+{
+	struct nvfancontrol_state *state = dev_get_drvdata(dev);
+	u8 reply[THERMAL_TELEMETRY_REPLY_LENGTH];
+	int ret;
+
+	ret = mutex_lock_interruptible(&state->request_lock);
+	if (ret)
+		return ret;
+
+	ret = ec_thermal_request(state, THERMAL_TELEMETRY_SNAPSHOT, NULL, 0,
+				  reply, sizeof(reply));
+
+	mutex_unlock(&state->request_lock);
+
+	if (ret)
+		return ret;
+
+	return emit_hex(buf, reply, sizeof(reply));
+}
+
+static DEVICE_ATTR_RO(fan_telemetry);
+
+static ssize_t fan_rpm_show(struct device *dev, struct device_attribute *attr,
+			     char *buf)
+{
+	struct nvfancontrol_state *state = dev_get_drvdata(dev);
+	u8 reply[THERMAL_TELEMETRY_REPLY_LENGTH];
+	u16 fan0_rpm, fan1_rpm;
+	int ret;
+
+	ret = mutex_lock_interruptible(&state->request_lock);
+	if (ret)
+		return ret;
+
+	ret = ec_thermal_request(state, THERMAL_TELEMETRY_SNAPSHOT, NULL, 0,
+				  reply, sizeof(reply));
+
+	mutex_unlock(&state->request_lock);
+
+	if (ret)
+		return ret;
+
+	fan0_rpm = get_unaligned_le16(&reply[THERMAL_TELEMETRY_FAN0_RPM_OFFSET]);
+	fan1_rpm = get_unaligned_le16(&reply[THERMAL_TELEMETRY_FAN1_RPM_OFFSET]);
+
+	return sysfs_emit(buf, "fan0_rpm=%u fan1_rpm=%u\n", fan0_rpm, fan1_rpm);
+}
+
+static DEVICE_ATTR_RO(fan_rpm);
+
 static int fan_override_probe(struct ffa_device *fdev)
 {
 	struct nvfancontrol_state *state;
@@ -351,14 +509,47 @@ static int fan_override_probe(struct ffa_device *fdev)
 		return ret;
 	}
 
+	ret = device_create_file(&fdev->dev, &dev_attr_fan_caps);
+	if (ret) {
+		dev_err(&fdev->dev,
+			"failed to create sysfs fan_caps attribute: %d\n", ret);
+		goto err_remove_fan;
+	}
+
+	ret = device_create_file(&fdev->dev, &dev_attr_fan_telemetry);
+	if (ret) {
+		dev_err(&fdev->dev,
+			"failed to create sysfs fan_telemetry attribute: %d\n",
+			ret);
+		goto err_remove_fan_caps;
+	}
+
+	ret = device_create_file(&fdev->dev, &dev_attr_fan_rpm);
+	if (ret) {
+		dev_err(&fdev->dev,
+			"failed to create sysfs fan_rpm attribute: %d\n", ret);
+		goto err_remove_fan_telemetry;
+	}
+
 	dev_info(&fdev->dev,
-		 "sysfs control ready: %s/fan accepts 'max' or 'auto'; module load issued no EC request\n",
+		 "sysfs control ready: %s/fan accepts 'max' or 'auto'; fan_caps, fan_telemetry, fan_rpm are read-only; module load issued no EC request\n",
 		 dev_name(&fdev->dev));
 	return 0;
+
+err_remove_fan_telemetry:
+	device_remove_file(&fdev->dev, &dev_attr_fan_telemetry);
+err_remove_fan_caps:
+	device_remove_file(&fdev->dev, &dev_attr_fan_caps);
+err_remove_fan:
+	device_remove_file(&fdev->dev, &dev_attr_fan);
+	return ret;
 }
 
 static void fan_override_remove(struct ffa_device *fdev)
 {
+	device_remove_file(&fdev->dev, &dev_attr_fan_rpm);
+	device_remove_file(&fdev->dev, &dev_attr_fan_telemetry);
+	device_remove_file(&fdev->dev, &dev_attr_fan_caps);
 	device_remove_file(&fdev->dev, &dev_attr_fan);
 	dev_warn(&fdev->dev,
 		 "module removed; unloading does NOT change the EC override value\n");
@@ -382,6 +573,6 @@ static struct ffa_driver fan_override_driver = {
 
 module_ffa_driver(fan_override_driver);
 
-MODULE_DESCRIPTION("DGX Spark persistent EC fan sysfs controller");
+MODULE_DESCRIPTION("DGX Spark persistent EC fan sysfs controller and telemetry reader");
 MODULE_AUTHOR("841973620");
 MODULE_LICENSE("GPL");
