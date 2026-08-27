@@ -6,19 +6,27 @@
  *
  *   /sys/bus/arm_ffa/devices/arm-ffa-17/fan            (read/write)
  *   /sys/bus/arm_ffa/devices/arm-ffa-17/fan_caps        (read-only)
+ *   /sys/bus/arm_ffa/devices/arm-ffa-17/fan_limits      (read-only)
  *   /sys/bus/arm_ffa/devices/arm-ffa-17/fan_telemetry   (read-only)
  *   /sys/bus/arm_ffa/devices/arm-ffa-17/fan_rpm         (read-only)
+ *   /sys/bus/arm_ffa/devices/arm-ffa-17/fan_override    (read-only)
  *
  * Writing "max" or "auto" to "fan" issues one OEM1 command 17 request
  * carrying EC thermal-mailbox inner command 5 (set high override slot).
  * Reading "fan_caps"/"fan_telemetry" issues the same OEM1 command 17
  * transport carrying EC inner command 1 (capabilities/mode/ranges) or 7
  * (64-byte live telemetry snapshot), and returns the raw EC reply bytes
- * as hex text. "fan_rpm" also issues inner command 7 and additionally
- * decodes the two live fan RPM fields found empirically within that
- * snapshot (see the comment above fan_rpm_show()). Requests are
- * serialized, and the interface remains available for subsequent
- * requests.
+ * as hex text. "fan_limits" issues the same inner command 1 as
+ * "fan_caps" and decodes its documented fields: the reported control
+ * mode and the minimum/maximum of both fan channels. "fan_rpm" also
+ * issues inner command 7 and additionally decodes the two live fan RPM
+ * fields found empirically within that snapshot (see the comment above
+ * fan_rpm_show()). "fan_override" issues
+ * inner commands 2 and 4 to read back the EC's two override slots (the
+ * low/cap slot this driver never writes, and the high/floor slot "fan"
+ * writes) directly, independent of this driver's own last-write cache.
+ * Requests are serialized, and the interface remains available for
+ * subsequent requests.
  */
 
 #include <linux/arm_ffa.h>
@@ -53,6 +61,8 @@
 
 #define THERMAL_OUTER_COMMAND        0x07U
 #define THERMAL_QUERY_CAPS           0x01U
+#define THERMAL_QUERY_LOW_OVERRIDE   0x02U
+#define THERMAL_QUERY_HIGH_OVERRIDE  0x04U
 #define THERMAL_SET_HIGH_OVERRIDE    0x05U
 #define THERMAL_TELEMETRY_SNAPSHOT   0x07U
 
@@ -63,6 +73,22 @@
 #define THERMAL_TELEMETRY_REPLY_LENGTH 67U
 #define THERMAL_MAX_REQUEST_LENGTH    (THERMAL_HEADER_LENGTH + THERMAL_FAN_EXTRA_LENGTH)
 #define THERMAL_MAX_REPLY_LENGTH      THERMAL_TELEMETRY_REPLY_LENGTH
+
+/*
+ * Layout of the inner-command-1 (capabilities) reply, documented in the
+ * project README: after the 3-byte echoed header come a capability byte
+ * and a mode byte, then the minimum and maximum of each fan channel as
+ * little-endian u16. In mode 0 those four values are RPM; in mode 1 they
+ * are PWM percentages.
+ */
+#define THERMAL_CAPS_MODE_OFFSET      4U
+#define THERMAL_CAPS_FAN0_MIN_OFFSET  5U
+#define THERMAL_CAPS_FAN0_MAX_OFFSET  7U
+#define THERMAL_CAPS_FAN1_MIN_OFFSET  9U
+#define THERMAL_CAPS_FAN1_MAX_OFFSET  11U
+
+#define THERMAL_CAPS_MODE_RPM         0U
+#define THERMAL_CAPS_MODE_PERCENT     1U
 
 /*
  * Offsets of the two live fan RPM fields (each little-endian u16) within
@@ -418,6 +444,53 @@ static ssize_t fan_caps_show(struct device *dev, struct device_attribute *attr,
 
 static DEVICE_ATTR_RO(fan_caps);
 
+static const char *caps_mode_name(u8 mode)
+{
+	switch (mode) {
+	case THERMAL_CAPS_MODE_RPM:
+		return "rpm";
+	case THERMAL_CAPS_MODE_PERCENT:
+		return "percent";
+	default:
+		return "unknown";
+	}
+}
+
+static ssize_t fan_limits_show(struct device *dev,
+				struct device_attribute *attr, char *buf)
+{
+	struct nvfancontrol_state *state = dev_get_drvdata(dev);
+	u8 reply[THERMAL_CAPS_REPLY_LENGTH];
+	u16 fan0_min, fan0_max, fan1_min, fan1_max;
+	u8 mode;
+	int ret;
+
+	ret = mutex_lock_interruptible(&state->request_lock);
+	if (ret)
+		return ret;
+
+	ret = ec_thermal_request(state, THERMAL_QUERY_CAPS, NULL, 0,
+				  reply, sizeof(reply));
+
+	mutex_unlock(&state->request_lock);
+
+	if (ret)
+		return ret;
+
+	mode = reply[THERMAL_CAPS_MODE_OFFSET];
+	fan0_min = get_unaligned_le16(&reply[THERMAL_CAPS_FAN0_MIN_OFFSET]);
+	fan0_max = get_unaligned_le16(&reply[THERMAL_CAPS_FAN0_MAX_OFFSET]);
+	fan1_min = get_unaligned_le16(&reply[THERMAL_CAPS_FAN1_MIN_OFFSET]);
+	fan1_max = get_unaligned_le16(&reply[THERMAL_CAPS_FAN1_MAX_OFFSET]);
+
+	return sysfs_emit(buf,
+			   "mode=%s(%u) fan0_min=%u fan0_max=%u fan1_min=%u fan1_max=%u\n",
+			   caps_mode_name(mode), mode, fan0_min, fan0_max,
+			   fan1_min, fan1_max);
+}
+
+static DEVICE_ATTR_RO(fan_limits);
+
 static ssize_t fan_telemetry_show(struct device *dev,
 				   struct device_attribute *attr, char *buf)
 {
@@ -469,6 +542,42 @@ static ssize_t fan_rpm_show(struct device *dev, struct device_attribute *attr,
 }
 
 static DEVICE_ATTR_RO(fan_rpm);
+
+static ssize_t fan_override_show(struct device *dev,
+				  struct device_attribute *attr, char *buf)
+{
+	struct nvfancontrol_state *state = dev_get_drvdata(dev);
+	u8 low_reply[THERMAL_FAN_REPLY_LENGTH];
+	u8 high_reply[THERMAL_FAN_REPLY_LENGTH];
+	u16 low, high;
+	int ret;
+
+	ret = mutex_lock_interruptible(&state->request_lock);
+	if (ret)
+		return ret;
+
+	ret = ec_thermal_request(state, THERMAL_QUERY_LOW_OVERRIDE, NULL, 0,
+				  low_reply, sizeof(low_reply));
+	if (!ret)
+		ret = ec_thermal_request(state, THERMAL_QUERY_HIGH_OVERRIDE,
+					  NULL, 0, high_reply,
+					  sizeof(high_reply));
+
+	mutex_unlock(&state->request_lock);
+
+	if (ret)
+		return ret;
+
+	low = get_unaligned_le16(&low_reply[THERMAL_HEADER_LENGTH]);
+	high = get_unaligned_le16(&high_reply[THERMAL_HEADER_LENGTH]);
+
+	return sysfs_emit(buf, "low=%#06x(%u)%s high=%#06x(%u)%s\n",
+			   low, low, low == TARGET_AUTOMATIC ? " disabled" : "",
+			   high, high,
+			   high == TARGET_AUTOMATIC ? " disabled" : "");
+}
+
+static DEVICE_ATTR_RO(fan_override);
 
 static int fan_override_probe(struct ffa_device *fdev)
 {
@@ -531,11 +640,31 @@ static int fan_override_probe(struct ffa_device *fdev)
 		goto err_remove_fan_telemetry;
 	}
 
+	ret = device_create_file(&fdev->dev, &dev_attr_fan_override);
+	if (ret) {
+		dev_err(&fdev->dev,
+			"failed to create sysfs fan_override attribute: %d\n",
+			ret);
+		goto err_remove_fan_rpm;
+	}
+
+	ret = device_create_file(&fdev->dev, &dev_attr_fan_limits);
+	if (ret) {
+		dev_err(&fdev->dev,
+			"failed to create sysfs fan_limits attribute: %d\n",
+			ret);
+		goto err_remove_fan_override;
+	}
+
 	dev_info(&fdev->dev,
-		 "sysfs control ready: %s/fan accepts 'max' or 'auto'; fan_caps, fan_telemetry, fan_rpm are read-only; module load issued no EC request\n",
+		 "sysfs control ready: %s/fan accepts 'max' or 'auto'; fan_caps, fan_limits, fan_telemetry, fan_rpm, fan_override are read-only; module load issued no EC request\n",
 		 dev_name(&fdev->dev));
 	return 0;
 
+err_remove_fan_override:
+	device_remove_file(&fdev->dev, &dev_attr_fan_override);
+err_remove_fan_rpm:
+	device_remove_file(&fdev->dev, &dev_attr_fan_rpm);
 err_remove_fan_telemetry:
 	device_remove_file(&fdev->dev, &dev_attr_fan_telemetry);
 err_remove_fan_caps:
@@ -547,6 +676,8 @@ err_remove_fan:
 
 static void fan_override_remove(struct ffa_device *fdev)
 {
+	device_remove_file(&fdev->dev, &dev_attr_fan_limits);
+	device_remove_file(&fdev->dev, &dev_attr_fan_override);
 	device_remove_file(&fdev->dev, &dev_attr_fan_rpm);
 	device_remove_file(&fdev->dev, &dev_attr_fan_telemetry);
 	device_remove_file(&fdev->dev, &dev_attr_fan_caps);

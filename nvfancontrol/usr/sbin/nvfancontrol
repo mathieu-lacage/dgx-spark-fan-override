@@ -8,6 +8,7 @@ fan_path="$ffa_device/fan"
 caps_path="$ffa_device/fan_caps"
 telemetry_path="$ffa_device/fan_telemetry"
 rpm_path="$ffa_device/fan_rpm"
+override_path="$ffa_device/fan_override"
 module='nvfancontrol'
 default_log='/var/log/nvfancontrol-telemetry.csv'
 
@@ -153,24 +154,26 @@ sensors_temps() {
 }
 
 sample_telemetry() {
-    local ts fan_mode rpm telemetry_hex temps
+    local ts fan_mode rpm override telemetry_hex temps
 
     ts="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
     fan_mode="$(tr -d '\r\n' < "$fan_path")"
     rpm="$(tr -d '\r\n' < "$rpm_path")"
+    override="$(tr -d '\r\n' < "$override_path" 2>/dev/null || printf 'unavailable')"
     telemetry_hex="$(tr -d '\r\n' < "$telemetry_path")"
     temps="$(sensors_temps)"
 
-    printf '%s fan=%s %s temps=%s telemetry=%s\n' "$ts" "$fan_mode" "$rpm" "$temps" "$telemetry_hex"
+    printf '%s fan=%s %s override=%s temps=%s telemetry=%s\n' \
+        "$ts" "$fan_mode" "$rpm" "$override" "$temps" "$telemetry_hex"
 
     if [ "$watch" -eq 1 ]; then
         if [ ! -s "$log_path" ]; then
-            printf 'timestamp,fan_mode,fan0_rpm,fan1_rpm,temps,telemetry_hex\n' > "$log_path"
+            printf 'timestamp,fan_mode,fan0_rpm,fan1_rpm,override,temps,telemetry_hex\n' > "$log_path"
         fi
-        printf '%s,%s,%s,%s,"%s",%s\n' "$ts" "$fan_mode" \
+        printf '%s,%s,%s,%s,"%s","%s",%s\n' "$ts" "$fan_mode" \
             "$(printf '%s' "$rpm" | grep -oP 'fan0_rpm=\K[0-9]+')" \
             "$(printf '%s' "$rpm" | grep -oP 'fan1_rpm=\K[0-9]+')" \
-            "$temps" "$telemetry_hex" >> "$log_path"
+            "$override" "$temps" "$telemetry_hex" >> "$log_path"
     fi
 }
 
