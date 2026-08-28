@@ -11,11 +11,11 @@ modules.order
 # GPU thermal-stress exploration tooling: kept locally, not part of this
 # repo's committed history (compiled binaries and the CUDA sources/wrapper
 # script that drives them).
-nvfancontrol/scripts/gpu_burn
-nvfancontrol/scripts/gpu_burn_gemm
-nvfancontrol/scripts/gpu_burn.cu
-nvfancontrol/scripts/gpu_burn_gemm.cu
-nvfancontrol/scripts/thermal_ceiling_test.sh
+scripts/gpu_burn
+scripts/gpu_burn_gemm
+scripts/gpu_burn.cu
+scripts/gpu_burn_gemm.cu
+scripts/thermal_ceiling_test.sh
 
 # Built .deb packages
 *.deb
