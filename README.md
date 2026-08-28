@@ -10,9 +10,14 @@
 
 安装后的模块会持续绑定 `arm-ffa-17`，并创建：
 ```text
-/sys/bus/arm_ffa/devices/arm-ffa-17/fan
+/sys/bus/arm_ffa/devices/arm-ffa-17/fan            (可读写)
+/sys/bus/arm_ffa/devices/arm-ffa-17/fan_caps        (只读)
+/sys/bus/arm_ffa/devices/arm-ffa-17/fan_limits      (只读)
+/sys/bus/arm_ffa/devices/arm-ffa-17/fan_telemetry   (只读)
+/sys/bus/arm_ffa/devices/arm-ffa-17/fan_rpm         (只读)
+/sys/bus/arm_ffa/devices/arm-ffa-17/fan_override    (可读写)
 ```
-每次向 `fan` 写入 `max` 或 `auto` 时发送一次请求，读取该属性会返回 `ready`、`max`、`auto` 或 `error <errno>`。
+每次向 `fan` 写入 `max` 或 `auto` 时发送一次请求，读取该属性会返回 `ready`、`max`、`auto` 或 `error <errno>`。`fan_caps`/`fan_telemetry` 以十六进制文本返回 EC 原始回复；`fan_limits` 解码能力回复（控制模式、fan0/fan1 最小/最大值）；`fan_rpm` 解码遥测快照中经验证得到的两路实时风扇转速字段。`fan_override` 读取时直接回读两个 EC 覆盖槽；写入 `"<low> <high>"`（十进制或 `0x` 前缀十六进制，均为 0-65535）可一次性设置两个槽，用于测试下文内核温控区所依赖的钳位机制。当 `nvfancontrol_ec` 温控区（见下文）处于 enabled 状态时，`fan` 与 `fan_override` 的写入会被拒绝并返回 `-EBUSY`，因为此时两个槽由内核控制回路占用。
 
 --------
 
@@ -102,6 +107,46 @@ fan0: 13500 > 9000  -> RPM 转换函数返回 100%
 fan1: 13500 = 13500 -> RPM 转换函数返回 100%
 最终公共 PWM 路径再次执行 min(target, 100)
 ```
+
+### 内核温控区集成（v1.1.0+）
+
+向两个覆盖槽写入相同的值即可将风扇目标精确钳位在该值上（EC 的应用函数会把曲线输出钳制在低端/封顶槽与高端/托底槽之间），因此这两个槽合起来就是一个完整的 `set_fan_speed(rpm)` 原语，EC 自身的限速逻辑（每次更新最多 +10%/-1%）还能免费提供平滑过渡。模块利用这一点在 Linux 通用温控框架中注册了一个温控区（thermal zone）和一个制冷设备（cooling device）：
+
+```text
+/sys/class/thermal/thermal_zoneX/   (type: nvfancontrol_ec)
+/sys/class/thermal/cooling_deviceY/ (type: nvfancontrol_fan)
+```
+
+加载模块时两者都会被注册，但温控区保持 **disabled** 状态——这与上文"加载不发出 EC 请求"的约定一致。在向该温控区的 `mode` 属性写入 `enabled` 之前，任何行为都不会改变：
+
+```text
+echo enabled > /sys/class/thermal/thermal_zoneX/mode   # 内核调速器接管
+echo disabled > /sys/class/thermal/thermal_zoneX/mode  # 将两个槽释放回 EC（0xFFFF/0xFFFF）
+```
+
+启用后，内核的 `step_wise` 调速器会根据 4 个触发点（trip）驱动制冷设备的 6 个状态（0-4 为钳位状态，5 为释放），这些触发点**默认近似 EC 自身的曲线**（75/89/95/96 °C，回滞 10/10/20/20 °C——最后一级从最初的 98 °C 调整为 96 °C，因为一次满载热压测试显示 EC 原生曲线实际在约 95-96 °C 就跳到了 100% 档位，而非 98 °C）——因此启用后在未经调优前变化很小，可通过该温控区的标准 sysfs 接口调优：
+
+```text
+cat  /sys/class/thermal/thermal_zoneX/trip_point_0_temp
+echo 70000 > /sys/class/thermal/thermal_zoneX/trip_point_0_temp   # 单位：毫摄氏度
+echo 5000  > /sys/class/thermal/thermal_zoneX/trip_point_0_hyst
+```
+
+状态 0-4 写入的值，是在 fan1 的控制域范围 `[fan1_min, fan1_max]`（首次启用时由 caps command 1 读取一次并缓存）上按 EC 曲线百分比（30/40/54/75/85%）线性插值得到的——**并非**字面意义上的 RPM 目标值。在验证所用的机器上，将该值钳位到接近该范围顶端时，实测 `fan_rpm` 明显高于所写入的值，也高于文档记载的 `fan1_max`；这是 EC 内部"控制域数值 → 实际转速"映射本身的特性，不是 bug，也不影响钳位机制本身的正确性。状态 5（释放）则完全将控制权交还给 EC 的原生曲线——配置的触发点区间顶端也落在这里，因此 EC 固件自身的温控保护始终是过热时的最终防线。
+
+**温度来源。** `.get_temp` 直接对平台上每一个 ACPI `ThermalZone()` 对象读取 `_TMP`（首次调用时通过 `acpi_walk_namespace(ACPI_TYPE_THERMAL, ...)` 一次性找到全部对象并缓存句柄），取其中的最大值——这与 `drivers/acpi/thermal.c` 自身内部使用的是同一个标准的、已导出的 ACPICA 调用，而非 EC 自身的遥测数据。不产生 FF-A 事务，因此轮询是免费的；只有真正的风扇设定值变化才会触碰 EC 邮箱。这并非最初尝试的方案：一开始曾用看似更简单的 `thermal_zone_get_zone_by_name("acpitz")`，但该调用在设计上就会在多个已注册温控区共用同一名字时明确返回 `-EEXIST`（已在内核源码中确认，并在本机上实测复现——该平台全部 7 个 `acpitz` 温控区恰好共用同一名字）——它是刻意拒绝有歧义的匹配，而非静默挑一个返回，因此在这台机器上它从未真正解析出一个可用的温控区。直接读取 ACPI `_TMP`彻底绕开了这个问题：遍历的是 ACPI 对象本身而非 Linux 温控类设备列表，不存在命名歧义，而且天然聚合了全部 7 个真实传感器，无需依赖某一个恰好追踪到最大值。
+
+**故障保护（failsafe）。** 三个模块参数，均可在运行时通过 `/sys/module/nvfancontrol/parameters/` 调整：
+
+| 参数 | 默认值 | 作用 |
+|---|---:|---|
+| `failsafe_temp` | 100（°C） | 温度一旦达到该值，无论调速器处于何种状态，立即释放两个槽（0xFFFF/0xFFFF） |
+| `failsafe_hyst` | 5（°C） | 只有当温度降到 `failsafe_temp - failsafe_hyst` 以下，内核控制才会重新接管 |
+| `override_fail_limit` | 3 | 连续多少次 EC 覆盖写入失败后，温控区自我禁用（同时释放槽位） |
+
+`failsafe_temp`（100 °C）相对镜像曲线顶端触发点（96 °C）留有充分余量，因此默认配置下完整曲线是可达的；一次满载压测（CPU `stress-ng` 叠加 GPU GEMM 满载）显示，在持续 20 分钟的近最坏情况满载下，整机会稳定在约 90-96 °C 的平衡点，全程未触发故障保护，因此 100 °C 相对正常运行状态仍留有实际余量。
+
+无论温控区是否曾被启用，一个重启/关机通知器都会尽力释放两个槽位，因为正常重启后槽位状态会一直保持，直到 EC 断电重置才会复位。唯一无法覆盖的情形是硬崩溃（没有正常关机路径）——这由同样的"顶端释放回 EC"状态与故障保护机制兜底。
 
 ### EC 温控邮箱的全部 inner command
 

@@ -10,9 +10,14 @@ Restore default: 07 05 00 FF FF    # 0xFFFF = Override slot disabled
 
 Once installed, the module binds to `arm-ffa-17` and creates the following:
 ```text
-/sys/bus/arm_ffa/devices/arm-ffa-17/fan
+/sys/bus/arm_ffa/devices/arm-ffa-17/fan            (read/write)
+/sys/bus/arm_ffa/devices/arm-ffa-17/fan_caps        (read-only)
+/sys/bus/arm_ffa/devices/arm-ffa-17/fan_limits      (read-only)
+/sys/bus/arm_ffa/devices/arm-ffa-17/fan_telemetry   (read-only)
+/sys/bus/arm_ffa/devices/arm-ffa-17/fan_rpm         (read-only)
+/sys/bus/arm_ffa/devices/arm-ffa-17/fan_override    (read/write)
 ```
-A request is sent each time `max` or `auto` is written to `fan`; reading this attribute returns `ready`, `max`, `auto`, or `error <errno>`. --------
+A request is sent each time `max` or `auto` is written to `fan`; reading this attribute returns `ready`, `max`, `auto`, or `error <errno>`. `fan_caps`/`fan_telemetry` return the raw EC reply as hex text; `fan_limits` decodes the capabilities reply (control mode, fan0/fan1 min/max); `fan_rpm` decodes the two live fan RPM fields found empirically in the telemetry snapshot. `fan_override` reads back both EC override slots directly; writing `"<low> <high>"` (decimal or `0x`-prefixed hex, each 0-65535) sets them both in one go, for testing the pinning mechanism the kernel thermal zone below relies on. `fan` and `fan_override` writes are refused with `-EBUSY` while the `nvfancontrol_ec` thermal zone (see below) is enabled, since it then owns both slots. --------
 
 ### Control Link
 
@@ -100,6 +105,46 @@ fan0: 13500 > 9000  -> RPM conversion function returns 100%
 fan1: 13500 = 13500 -> RPM conversion function returns 100%
 The final common PWM path then executes min(target, 100)
 ```
+
+### Kernel Thermal Zone Integration (v1.1.0+)
+
+Writing the same value to both override slots pins the fan target exactly there (the apply function clamps its curve output between the low/cap and high/floor slots), so the two slots together are a full `set_fan_speed(rpm)` primitive, with the EC's own slew limiter (+10%/-1% per update) smoothing transitions for free. The module uses this to register a thermal zone and cooling device in the generic Linux thermal framework:
+
+```text
+/sys/class/thermal/thermal_zoneX/   (type: nvfancontrol_ec)
+/sys/class/thermal/cooling_deviceY/ (type: nvfancontrol_fan)
+```
+
+Loading the module registers both but leaves the zone **disabled** — consistent with the "no EC request at load" invariant. Nothing changes until you write `enabled` to the zone's `mode` attribute:
+
+```text
+echo enabled > /sys/class/thermal/thermal_zoneX/mode   # kernel governor takes over
+echo disabled > /sys/class/thermal/thermal_zoneX/mode  # releases both slots back to the EC (0xFFFF/0xFFFF)
+```
+
+While enabled, the kernel's `step_wise` governor drives the cooling device's 6 states (0-4 pinned, 5 = release) from 4 trips that **default to approximating the EC's own curve** (75/89/95/96 °C, hysteresis 10/10/20/20 °C — the last figure adjusted from an initial 98 °C to 96 °C after a thermal-ceiling stress test showed the real EC curve jumping to its 100% state around 95-96 °C, not 98 °C) — so enabling it changes little until you tune it via the zone's standard sysfs:
+
+```text
+cat  /sys/class/thermal/thermal_zoneX/trip_point_0_temp
+echo 70000 > /sys/class/thermal/thermal_zoneX/trip_point_0_temp   # millidegrees C
+echo 5000  > /sys/class/thermal/thermal_zoneX/trip_point_0_hyst
+```
+
+States 0-4 write a value interpolated over fan1's control-domain range `[fan1_min, fan1_max]` (read once from caps command 1) at the EC curve's percentages (30/40/54/75/85%) — **not** a literal RPM target. On the unit this was verified on, pinning near the top of that range produced a real measured `fan_rpm` noticeably above both the requested value and the documented `fan1_max`; that's an EC-internal control-domain-to-real-RPM mapping quirk, not a bug, and doesn't affect correctness of the pinning itself. State 5 (release) hands control back to the EC's native curve entirely — this is also where the top of the configured trip range lands, so the EC firmware's own thermal failsafe stays the ultimate backstop when hot.
+
+**Temperature source.** `.get_temp` reads ACPI `_TMP` directly on every ACPI `ThermalZone()` object on the platform (found once via `acpi_walk_namespace(ACPI_TYPE_THERMAL, ...)`, cached thereafter) and returns the max — the same standard, exported ACPICA call `drivers/acpi/thermal.c` itself uses internally, not the EC's own telemetry. No FF-A transaction, so polling is free; only actual fan-setpoint changes touch the EC mailbox. This wasn't the first design tried: `thermal_zone_get_zone_by_name("acpitz")` looked simpler, but that call explicitly returns `-EEXIST` whenever more than one registered zone shares a name (confirmed both in kernel source and live on this box, where all 7 `acpitz` zones do) — it refuses ambiguity by design rather than silently picking one, so it never returned a usable zone here. Reading ACPI `_TMP` directly sidesteps that entirely: there's no naming ambiguity walking ACPI objects instead of the Linux thermal-class device list, and it naturally aggregates all 7 real sensors instead of trusting any single one to track the max.
+
+**Failsafe.** Three module parameters, writable at runtime under `/sys/module/nvfancontrol/parameters/`:
+
+| Parameter | Default | Effect |
+|---|---:|---|
+| `failsafe_temp` | 100 (°C) | Immediately releases both slots (0xFFFF/0xFFFF) the moment temp reaches this, regardless of governor state |
+| `failsafe_hyst` | 5 (°C) | Kernel control only re-engages once temp drops below `failsafe_temp - failsafe_hyst` |
+| `override_fail_limit` | 3 | Consecutive EC override-write failures before the zone disables itself (also releasing) |
+
+`failsafe_temp` (100 °C) sits comfortably above the top mirrored trip (96 °C), so the full curve is reachable with stock defaults; a sustained max-load stress test (combined CPU `stress-ng` + a GPU GEMM burn) found the machine settling into a stable ~90-96 °C equilibrium under 20 minutes of sustained worst-case-ish load without ever needing the failsafe, so 100 °C still leaves real margin above normal operation.
+
+A reboot/shutdown notifier releases both slots (best-effort) regardless of whether the zone was ever enabled, since the slots otherwise persist across a normal reboot until EC power-cycle. The one case this can't cover is a hard crash (no clean shutdown path) — mitigated by the same release-to-EC top state and failsafe.
 
 ### Complete list of inner commands for the EC thermal control mailbox
 

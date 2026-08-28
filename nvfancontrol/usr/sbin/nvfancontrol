@@ -13,11 +13,16 @@ module='nvfancontrol'
 default_log='/var/log/nvfancontrol-telemetry.csv'
 
 usage() {
-    printf 'Usage: sudo nvfancontrol {max|auto|status|unload|telemetry [--watch] [--interval N] [--log PATH]}\n' >&2
+    printf 'Usage: sudo nvfancontrol {max|auto|status|unload|enable|disable|curve|telemetry [--watch] [--interval N] [--log PATH]}\n' >&2
     printf '  max        load the module if needed, then write max to the fan sysfs interface\n' >&2
     printf '  auto       load the module if needed, then write auto to the fan sysfs interface\n' >&2
     printf '  status     show whether the module is loaded and read the fan interface\n' >&2
     printf '  unload     explicitly remove the module; the EC setting remains unchanged\n' >&2
+    printf '  enable     load the module if needed, then enable the nvfancontrol_ec thermal zone\n' >&2
+    printf '             (kernel step_wise governor takes over both EC override slots)\n' >&2
+    printf '  disable    disable the nvfancontrol_ec thermal zone (releases overrides to the EC)\n' >&2
+    printf '  curve      show the thermal zone/cooling device status: mode, temp, trip points,\n' >&2
+    printf '             cooling state, fan_rpm, fan_override (read-only, does not load the module)\n' >&2
     printf '  telemetry  read live EC fan telemetry and correlate it with sensors(1) temperatures\n' >&2
     printf '             --watch          keep sampling until interrupted (default: one shot)\n' >&2
     printf "             --interval N     seconds between samples in watch mode (default: 2)\n" >&2
@@ -27,7 +32,7 @@ usage() {
 
 action="${1:-}"
 case "$action" in
-    max|auto|status|unload|telemetry)
+    max|auto|status|unload|telemetry|enable|disable|curve)
         ;;
     -h|--help)
         usage
@@ -208,53 +213,158 @@ if [ "$action" = 'telemetry' ]; then
     done
 fi
 
-if [ "$action" = 'max' ] || [ "$action" = 'auto' ]; then
-    if ! module_is_loaded; then
-        if [ -L "$ffa_device/driver" ]; then
-            printf 'Refusing to continue: %s is already bound to %s\n' \
-                "$ffa_device" "$(readlink "$ffa_device/driver")" >&2
-            exit 1
-        fi
-
-        kernel_release="$(uname -r)"
-        module_path="$(modinfo -n "$module" 2>/dev/null || true)"
-        if [ -z "$module_path" ] || [ ! -r "$module_path" ]; then
-            printf 'nvfancontrol module is not installed for the running kernel %s.\n' \
-                "$kernel_release" >&2
-            printf 'Install matching headers, then reinstall or reconfigure the package.\n' >&2
-            exit 1
-        fi
-
-        module_name="$(modinfo -F name "$module_path")"
-        module_vermagic="$(modinfo -F vermagic "$module_path")"
-        if [ "$module_name" != "$module" ]; then
-            printf 'Refusing unexpected module name %s in %s\n' "$module_name" "$module_path" >&2
-            exit 1
-        fi
-        case "$module_vermagic" in
-            "$kernel_release "*)
-                ;;
-            *)
-                printf 'Module vermagic does not match the running kernel: %s\n' "$module_vermagic" >&2
-                exit 1
-                ;;
-        esac
-
-        insmod "$module_path"
-
-        for _ in {1..50}; do
-            if [ -e "$fan_path" ]; then
-                break
-            fi
-            sleep 0.1
-        done
-
-        if [ ! -e "$fan_path" ]; then
-            printf 'Module loaded but the fan sysfs interface was not created.\n' >&2
-            rmmod "$module" || true
-            exit 1
-        fi
+load_module_if_needed() {
+    if module_is_loaded; then
+        return 0
     fi
+
+    if [ -L "$ffa_device/driver" ]; then
+        printf 'Refusing to continue: %s is already bound to %s\n' \
+            "$ffa_device" "$(readlink "$ffa_device/driver")" >&2
+        exit 1
+    fi
+
+    kernel_release="$(uname -r)"
+    module_path="$(modinfo -n "$module" 2>/dev/null || true)"
+    if [ -z "$module_path" ] || [ ! -r "$module_path" ]; then
+        printf 'nvfancontrol module is not installed for the running kernel %s.\n' \
+            "$kernel_release" >&2
+        printf 'Install matching headers, then reinstall or reconfigure the package.\n' >&2
+        exit 1
+    fi
+
+    module_name="$(modinfo -F name "$module_path")"
+    module_vermagic="$(modinfo -F vermagic "$module_path")"
+    if [ "$module_name" != "$module" ]; then
+        printf 'Refusing unexpected module name %s in %s\n' "$module_name" "$module_path" >&2
+        exit 1
+    fi
+    case "$module_vermagic" in
+        "$kernel_release "*)
+            ;;
+        *)
+            printf 'Module vermagic does not match the running kernel: %s\n' "$module_vermagic" >&2
+            exit 1
+            ;;
+    esac
+
+    insmod "$module_path"
+
+    for _ in {1..50}; do
+        if [ -e "$fan_path" ]; then
+            break
+        fi
+        sleep 0.1
+    done
+
+    if [ ! -e "$fan_path" ]; then
+        printf 'Module loaded but the fan sysfs interface was not created.\n' >&2
+        rmmod "$module" || true
+        exit 1
+    fi
+}
+
+# Finds the nvfancontrol_ec thermal zone and nvfancontrol_fan cooling device
+# by scanning sysfs type files, since their thermal_zoneN/cooling_deviceN
+# index depends on how many other zones/cdevs are already registered.
+# Sets zone_path/cdev_path (empty if not found); safe under `set -e`.
+find_zone_cdev() {
+    zone_path=""
+    cdev_path=""
+    for t in /sys/class/thermal/thermal_zone*; do
+        if [ -r "$t/type" ] && [ "$(cat "$t/type" 2>/dev/null)" = "nvfancontrol_ec" ]; then
+            zone_path="$t"
+        fi
+    done
+    for t in /sys/class/thermal/cooling_device*; do
+        if [ -r "$t/type" ] && [ "$(cat "$t/type" 2>/dev/null)" = "nvfancontrol_fan" ]; then
+            cdev_path="$t"
+        fi
+    done
+}
+
+if [ "$action" = 'enable' ]; then
+    load_module_if_needed
+    find_zone_cdev
+    if [ -z "$zone_path" ]; then
+        printf 'nvfancontrol_ec thermal zone not found under /sys/class/thermal/\n' >&2
+        exit 1
+    fi
+    current_mode="$(tr -d '\r\n' < "$zone_path/mode")"
+    if [ "$current_mode" = 'enabled' ]; then
+        printf 'Already enabled.\n'
+        exit 0
+    fi
+    echo enabled > "$zone_path/mode"
+    after="$(tr -d '\r\n' < "$zone_path/mode")"
+    if [ "$after" != 'enabled' ]; then
+        printf 'Unexpected mode after write: expected enabled, observed %s\n' "$after" >&2
+        exit 1
+    fi
+    printf 'OK: %s enabled. Kernel governor now owns both EC override slots.\n' "$zone_path"
+    exit 0
+fi
+
+if [ "$action" = 'disable' ]; then
+    if ! module_is_loaded; then
+        printf 'nvfancontrol module is not loaded; nothing to disable.\n'
+        exit 0
+    fi
+    find_zone_cdev
+    if [ -z "$zone_path" ]; then
+        printf 'nvfancontrol_ec thermal zone not found under /sys/class/thermal/\n' >&2
+        exit 1
+    fi
+    current_mode="$(tr -d '\r\n' < "$zone_path/mode")"
+    if [ "$current_mode" = 'disabled' ]; then
+        printf 'Already disabled.\n'
+        exit 0
+    fi
+    echo disabled > "$zone_path/mode"
+    after="$(tr -d '\r\n' < "$zone_path/mode")"
+    if [ "$after" != 'disabled' ]; then
+        printf 'Unexpected mode after write: expected disabled, observed %s\n' "$after" >&2
+        exit 1
+    fi
+    printf 'OK: %s disabled. Overrides released back to the EC (0xffff/0xffff).\n' "$zone_path"
+    exit 0
+fi
+
+if [ "$action" = 'curve' ]; then
+    if ! module_is_loaded; then
+        printf 'Module: unloaded\n'
+        exit 0
+    fi
+    find_zone_cdev
+    if [ -z "$zone_path" ] || [ -z "$cdev_path" ]; then
+        printf 'nvfancontrol_ec zone or nvfancontrol_fan cdev not found under /sys/class/thermal/\n' >&2
+        exit 1
+    fi
+    printf 'zone: %s\n' "$zone_path"
+    printf 'cooling device: %s\n' "$cdev_path"
+    printf 'mode: %s\n' "$(tr -d '\r\n' < "$zone_path/mode")"
+    printf 'temp: %s mC\n' "$(tr -d '\r\n' < "$zone_path/temp" 2>/dev/null || printf 'unavailable')"
+    n=0
+    while [ -r "$zone_path/trip_point_${n}_temp" ]; do
+        printf 'trip%d: temp=%s hyst=%s\n' "$n" \
+            "$(tr -d '\r\n' < "$zone_path/trip_point_${n}_temp")" \
+            "$(tr -d '\r\n' < "$zone_path/trip_point_${n}_hyst" 2>/dev/null || printf '?')"
+        n=$((n + 1))
+    done
+    printf 'cooling state: %s / %s (max)\n' \
+        "$(tr -d '\r\n' < "$cdev_path/cur_state")" \
+        "$(tr -d '\r\n' < "$cdev_path/max_state")"
+    if [ -r "$rpm_path" ]; then
+        printf 'fan_rpm: %s\n' "$(tr -d '\r\n' < "$rpm_path")"
+    fi
+    if [ -r "$override_path" ]; then
+        printf 'fan_override: %s\n' "$(tr -d '\r\n' < "$override_path")"
+    fi
+    exit 0
+fi
+
+if [ "$action" = 'max' ] || [ "$action" = 'auto' ]; then
+    load_module_if_needed
 
     if [ ! -L "$ffa_device/driver" ] ||
             [ "$(basename "$(readlink "$ffa_device/driver")")" != "$module" ]; then
@@ -265,6 +375,13 @@ if [ "$action" = 'max' ] || [ "$action" = 'auto' ]; then
 
     if [ ! -w "$fan_path" ]; then
         printf 'Fan interface is not writable: %s\n' "$fan_path" >&2
+        exit 1
+    fi
+
+    find_zone_cdev
+    if [ -n "$zone_path" ] && [ "$(tr -d '\r\n' < "$zone_path/mode" 2>/dev/null)" = 'enabled' ]; then
+        printf 'Refusing to write: the nvfancontrol_ec thermal zone is enabled and owns both override slots.\n' >&2
+        printf 'Run "sudo nvfancontrol disable" first, or use "sudo nvfancontrol curve" to inspect it.\n' >&2
         exit 1
     fi
 

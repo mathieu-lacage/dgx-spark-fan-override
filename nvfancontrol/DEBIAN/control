@@ -1,5 +1,5 @@
 Package: nvfancontrol
-Version: 1.0.0
+Version: 1.1.0
 Priority: optional
 Architecture: arm64
 Maintainer: 841973620 <admin@841973620.net>
@@ -7,4 +7,8 @@ Depends: bash, kmod, make, gcc, util-linux
 Suggests: dkms
 Description: DGX Spark persistent EC fan sysfs controller
  The module exposes a fan sysfs attribute that accepts either
- the 100% fan override or the EC automatic thermal policy.
+ the 100% fan override or the EC automatic thermal policy, a writable
+ fan_override attribute for direct EC override-slot testing, and a
+ thermal_zone/cooling_device pair (nvfancontrol_ec/nvfancontrol_fan)
+ that lets the kernel's step_wise governor drive the fans from a
+ host-tunable curve, opt-in via standard thermal sysfs.

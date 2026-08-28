@@ -9,7 +9,7 @@
  *   /sys/bus/arm_ffa/devices/arm-ffa-17/fan_limits      (read-only)
  *   /sys/bus/arm_ffa/devices/arm-ffa-17/fan_telemetry   (read-only)
  *   /sys/bus/arm_ffa/devices/arm-ffa-17/fan_rpm         (read-only)
- *   /sys/bus/arm_ffa/devices/arm-ffa-17/fan_override    (read-only)
+ *   /sys/bus/arm_ffa/devices/arm-ffa-17/fan_override    (read/write)
  *
  * Writing "max" or "auto" to "fan" issues one OEM1 command 17 request
  * carrying EC thermal-mailbox inner command 5 (set high override slot).
@@ -21,14 +21,33 @@
  * mode and the minimum/maximum of both fan channels. "fan_rpm" also
  * issues inner command 7 and additionally decodes the two live fan RPM
  * fields found empirically within that snapshot (see the comment above
- * fan_rpm_show()). "fan_override" issues
- * inner commands 2 and 4 to read back the EC's two override slots (the
- * low/cap slot this driver never writes, and the high/floor slot "fan"
- * writes) directly, independent of this driver's own last-write cache.
- * Requests are serialized, and the interface remains available for
- * subsequent requests.
+ * fan_rpm_show()). "fan_override" reads issue inner commands 2 and 4 to
+ * read back the EC's two override slots directly, independent of this
+ * driver's own last-write cache. "fan_override" writes accept
+ * "<low> <high>" (decimal or 0x-prefixed hex, each 0-65535) and issue
+ * inner commands 3 and 5 to write both slots (see ec_set_overrides());
+ * writing the same value to both pins the fan target there, since the EC
+ * apply function clamps its curve output between the low (cap) and high
+ * (floor) slots. This is separate from "fan", which only ever writes the
+ * high slot. Requests are serialized, and the interface remains available
+ * for subsequent requests.
+ *
+ * Loading also registers a "nvfancontrol_ec" thermal zone and an
+ * "nvfancontrol_fan" cooling device in the generic Linux thermal framework
+ * (visible under /sys/class/thermal/), but leaves the zone in disabled
+ * mode -- consistent with the "no EC request at load" invariant above.
+ * Writing "enabled" to that zone's sysfs "mode" attribute hands both
+ * override slots to the kernel's step_wise governor, which pins them
+ * according to a curve that defaults to mirroring the EC's own curve
+ * (tunable via the zone's trip_point_*_temp/_hyst sysfs). While that zone
+ * is enabled, "fan" and "fan_override" writes are refused with -EBUSY.
+ * failsafe_temp/failsafe_hyst/override_fail_limit module parameters
+ * (writable at runtime under /sys/module/nvfancontrol/parameters/) bound
+ * how far this can go before overrides are released back to the EC
+ * unconditionally.
  */
 
+#include <linux/acpi.h>
 #include <linux/arm_ffa.h>
 #include <linux/delay.h>
 #include <linux/device.h>
@@ -39,11 +58,15 @@
 #include <linux/ktime.h>
 #include <linux/mm.h>
 #include <linux/module.h>
+#include <linux/moduleparam.h>
 #include <linux/mutex.h>
+#include <linux/notifier.h>
 #include <linux/pfn.h>
+#include <linux/reboot.h>
 #include <linux/slab.h>
 #include <linux/string.h>
 #include <linux/sysfs.h>
+#include <linux/thermal.h>
 #include <linux/types.h>
 #include <linux/unaligned.h>
 #include <linux/uuid.h>
@@ -62,6 +85,7 @@
 #define THERMAL_OUTER_COMMAND        0x07U
 #define THERMAL_QUERY_CAPS           0x01U
 #define THERMAL_QUERY_LOW_OVERRIDE   0x02U
+#define THERMAL_SET_LOW_OVERRIDE     0x03U
 #define THERMAL_QUERY_HIGH_OVERRIDE  0x04U
 #define THERMAL_SET_HIGH_OVERRIDE    0x05U
 #define THERMAL_TELEMETRY_SNAPSHOT   0x07U
@@ -116,6 +140,40 @@
 #define REPLY_POLL_MS              10U
 #define ESPI_TIMEOUT_FLOOR_US      40000LL
 
+/*
+ * Kernel thermal-zone/cooling-device integration. Five pinned states
+ * (0..4) mirror the EC's own 5-level curve percentages; a 6th state
+ * releases both override slots back to the EC's native curve. Each of
+ * the 4 trips below drives the transition into one pinned state above
+ * idle (state 0 is simply "below the lowest trip").
+ */
+#define NVFANCONTROL_NUM_PIN_STATES  5U
+#define NVFANCONTROL_NUM_TRIPS       (NVFANCONTROL_NUM_PIN_STATES - 1U)
+#define NVFANCONTROL_RELEASE_STATE   NVFANCONTROL_NUM_PIN_STATES
+
+/* Upper bound on ACPI ThermalZone objects to track (7 observed on this platform). */
+#define NVFANCONTROL_MAX_ACPI_THERMAL 16U
+
+static int failsafe_temp = 100;
+module_param(failsafe_temp, int, 0644);
+MODULE_PARM_DESC(failsafe_temp,
+		 "Release EC overrides immediately once temp reaches this many degrees Celsius (default 100)");
+
+static int failsafe_hyst = 5;
+module_param(failsafe_hyst, int, 0644);
+MODULE_PARM_DESC(failsafe_hyst,
+		 "Degrees C below failsafe_temp before kernel control re-engages after a failsafe release (default 5)");
+
+static int override_fail_limit = 3;
+module_param(override_fail_limit, int, 0644);
+MODULE_PARM_DESC(override_fail_limit,
+		 "Consecutive EC override-write failures before disabling the thermal zone (default 3)");
+
+/* EC curve percentages for pinned states 0..4 (30/40/54/75/100%). */
+static const u8 nvfancontrol_curve_pct[NVFANCONTROL_NUM_PIN_STATES] = {
+	30, 40, 54, 75, 100
+};
+
 enum nvfancontrol_fan_state {
 	NVFANCONTROL_READY = 0,
 	NVFANCONTROL_MAX,
@@ -128,6 +186,32 @@ struct nvfancontrol_state {
 	struct mutex request_lock;
 	enum nvfancontrol_fan_state fan_state;
 	int last_error;
+
+	/*
+	 * ACPI Thermal Zone objects (ASL "ThermalZone()"), found once via
+	 * acpi_walk_namespace(ACPI_TYPE_THERMAL, ...) and queried directly
+	 * via their _TMP method thereafter. This is the same thing
+	 * drivers/acpi/thermal.c itself does internally to answer its own
+	 * zones' get_temp -- going straight to ACPI sidesteps
+	 * thermal_zone_get_zone_by_name()'s -EEXIST refusal (confirmed on
+	 * this kernel, 2026-08-27) when multiple registered zones share a
+	 * name, which all 7 "acpitz" zones on this platform do.
+	 */
+	acpi_handle acpi_thermal_handles[NVFANCONTROL_MAX_ACPI_THERMAL];
+	unsigned int acpi_thermal_handle_count;
+	bool acpi_thermal_resolved;
+	struct thermal_zone_device *tz;
+	struct thermal_cooling_device *cdev;
+	struct notifier_block reboot_nb;
+
+	bool tz_enabled;
+	bool failsafe_engaged;
+	unsigned long cur_state;
+	unsigned int override_fail_count;
+
+	bool ranges_valid;
+	u16 fan1_min;
+	u16 fan1_max;
 };
 
 static void restore_shared_page(struct device *dev, u8 *shm,
@@ -145,8 +229,8 @@ static void restore_shared_page(struct device *dev, u8 *shm,
 		return;
 	}
 
-	dev_info(dev, "shared-buffer restore verified (first %u bytes)\n",
-		 ESPI_NS_SHM_PROTOCOL_SIZE);
+	dev_dbg(dev, "shared-buffer restore verified (first %u bytes)\n",
+		ESPI_NS_SHM_PROTOCOL_SIZE);
 }
 
 static int ec_thermal_request(struct nvfancontrol_state *state, u8 inner_cmd,
@@ -181,10 +265,10 @@ static int ec_thermal_request(struct nvfancontrol_state *state, u8 inner_cmd,
 	if (map_memory)
 		reserved_page = PageReserved(pfn_to_page(pfn));
 
-	dev_info(&fdev->dev,
-		 "manifest ns_shm0: physical=%#llx size=%#x map_memory=%u page_reserved=%u\n",
-		 ESPI_NS_SHM_PA, ESPI_NS_SHM_SIZE,
-		 (unsigned int)map_memory, (unsigned int)reserved_page);
+	dev_dbg(&fdev->dev,
+		"manifest ns_shm0: physical=%#llx size=%#x map_memory=%u page_reserved=%u\n",
+		ESPI_NS_SHM_PA, ESPI_NS_SHM_SIZE,
+		(unsigned int)map_memory, (unsigned int)reserved_page);
 
 	if (map_memory && !reserved_page) {
 		dev_err(&fdev->dev,
@@ -199,8 +283,8 @@ static int ec_thermal_request(struct nvfancontrol_state *state, u8 inner_cmd,
 	}
 
 	memcpy(snapshot, shm, sizeof(snapshot));
-	dev_info(&fdev->dev, "shared pre-state: %*ph\n",
-		 (int)sizeof(snapshot), snapshot);
+	dev_dbg(&fdev->dev, "shared pre-state: %*ph\n",
+		(int)sizeof(snapshot), snapshot);
 
 	if (snapshot[GENERIC_INPUT_ACCEPTED] != 0 ||
 	    snapshot[GENERIC_OUTPUT_READY] != 0) {
@@ -225,9 +309,9 @@ static int ec_thermal_request(struct nvfancontrol_state *state, u8 inner_cmd,
 	memcpy(shm, frame, sizeof(frame));
 	mb();
 
-	dev_info(&fdev->dev,
-		 "starting inner-command %#04x request: fixed EC frame %*ph\n",
-		 inner_cmd, (int)request_len, request);
+	dev_dbg(&fdev->dev,
+		"starting inner-command %#04x request: fixed EC frame %*ph\n",
+		inner_cmd, (int)request_len, request);
 
 	payload[0] = ESPI_OEM_GENERIC_EMI;
 	start = ktime_get();
@@ -246,10 +330,10 @@ static int ec_thermal_request(struct nvfancontrol_state *state, u8 inner_cmd,
 	raw_response[2] = msg.data[2];
 	raw_response[3] = msg.data[3];
 	service_status = get_unaligned_le32((u8 *)msg.data);
-	dev_info(&fdev->dev,
-		 "command-17 response: status=%u elapsed=%lld us raw=%#018lx %#018lx %#018lx %#018lx\n",
-		 service_status, elapsed_us, raw_response[0], raw_response[1],
-		 raw_response[2], raw_response[3]);
+	dev_dbg(&fdev->dev,
+		"command-17 response: status=%u elapsed=%lld us raw=%#018lx %#018lx %#018lx %#018lx\n",
+		service_status, elapsed_us, raw_response[0], raw_response[1],
+		raw_response[2], raw_response[3]);
 
 	if (service_status != 0) {
 		if (service_status == 5 && elapsed_us >= ESPI_TIMEOUT_FLOOR_US)
@@ -284,11 +368,11 @@ static int ec_thermal_request(struct nvfancontrol_state *state, u8 inner_cmd,
 
 	mb();
 	memcpy(reply, &shm[GENERIC_DATA_OFFSET], reply_len);
-	dev_info(&fdev->dev,
-		 "EC reply after <=%u ms: accepted=%#04x ready=%#04x response=%*ph\n",
-		 elapsed, READ_ONCE(shm[GENERIC_INPUT_ACCEPTED]),
-		 READ_ONCE(shm[GENERIC_OUTPUT_READY]),
-		 (int)reply_len, reply);
+	dev_dbg(&fdev->dev,
+		"EC reply after <=%u ms: accepted=%#04x ready=%#04x response=%*ph\n",
+		elapsed, READ_ONCE(shm[GENERIC_INPUT_ACCEPTED]),
+		READ_ONCE(shm[GENERIC_OUTPUT_READY]),
+		(int)reply_len, reply);
 
 	if (reply_len < request_len || memcmp(reply, request, request_len)) {
 		dev_crit(&fdev->dev,
@@ -301,7 +385,7 @@ static int ec_thermal_request(struct nvfancontrol_state *state, u8 inner_cmd,
 		goto out_unmap;
 	}
 
-	dev_info(&fdev->dev, "inner-command %#04x ACKNOWLEDGED\n", inner_cmd);
+	dev_dbg(&fdev->dev, "inner-command %#04x ACKNOWLEDGED\n", inner_cmd);
 
 	result = 0;
 	restore_shared_page(&fdev->dev, shm, snapshot, &result);
@@ -341,6 +425,401 @@ static int submit_fan_request(struct nvfancontrol_state *state, u16 target)
 
 	return 0;
 }
+
+/*
+ * Writes both EC override slots. The EC apply function clamps its curve
+ * output between the low (cap) and high (floor) slots, so writing the same
+ * value to both pins the fan target exactly there. If the second write
+ * fails after the first succeeded, best-effort restore the low slot to
+ * 0xFFFF (disabled) rather than leave a stray cap in place; a failure of
+ * that restore is logged at dev_crit since EC override state is then
+ * genuinely unknown to the host.
+ */
+static int ec_set_overrides(struct nvfancontrol_state *state, u16 low, u16 high)
+{
+	u8 extra[THERMAL_FAN_EXTRA_LENGTH];
+	u8 reply[THERMAL_FAN_REPLY_LENGTH];
+	int ret;
+
+	put_unaligned_le16(low, extra);
+	ret = ec_thermal_request(state, THERMAL_SET_LOW_OVERRIDE, extra,
+				  sizeof(extra), reply, sizeof(reply));
+	if (ret)
+		return ret;
+
+	put_unaligned_le16(high, extra);
+	ret = ec_thermal_request(state, THERMAL_SET_HIGH_OVERRIDE, extra,
+				  sizeof(extra), reply, sizeof(reply));
+	if (ret) {
+		int restore_ret;
+
+		put_unaligned_le16(TARGET_AUTOMATIC, extra);
+		restore_ret = ec_thermal_request(state, THERMAL_SET_LOW_OVERRIDE,
+						  extra, sizeof(extra), reply,
+						  sizeof(reply));
+		if (restore_ret)
+			dev_crit(&state->fdev->dev,
+				 "failed to restore low override to 0xffff after high-override failure (restore ret=%d); EC override state is unknown\n",
+				 restore_ret);
+		return ret;
+	}
+
+	return 0;
+}
+
+/*
+ * Best-effort override release, shared by change_mode(DISABLED), remove(),
+ * and the reboot/shutdown notifier. A write failure here is logged but not
+ * otherwise handled: there is nothing more this driver can do if the EC
+ * itself is not responding at this point.
+ */
+static void nvfancontrol_release(struct nvfancontrol_state *state, const char *why)
+{
+	int ret;
+
+	mutex_lock(&state->request_lock);
+	ret = ec_set_overrides(state, TARGET_AUTOMATIC, TARGET_AUTOMATIC);
+	if (!ret)
+		state->cur_state = NVFANCONTROL_RELEASE_STATE;
+	mutex_unlock(&state->request_lock);
+
+	if (ret)
+		dev_crit(&state->fdev->dev,
+			 "%s: failed to release EC overrides (ret=%d); EC override state is unknown\n",
+			 why, ret);
+	else
+		dev_warn(&state->fdev->dev,
+			 "%s: EC overrides released (0xffff/0xffff)\n", why);
+}
+
+static int nvfancontrol_reboot_notify(struct notifier_block *nb,
+				       unsigned long action, void *data)
+{
+	struct nvfancontrol_state *state =
+		container_of(nb, struct nvfancontrol_state, reboot_nb);
+
+	nvfancontrol_release(state, "reboot/shutdown notifier");
+
+	return NOTIFY_DONE;
+}
+
+/*
+ * Immediate, ungoverned safety valve: independent of whatever the step_wise
+ * governor's trip evaluation is doing, force both slots back to automatic
+ * the moment temp reaches failsafe_temp, and hold there (set_cur_state()
+ * checks failsafe_engaged and clamps any requested state to the release
+ * state) until temp drops back below failsafe_temp - failsafe_hyst. Called
+ * from get_temp(), so this runs on every poll.
+ */
+static void nvfancontrol_failsafe_check(struct nvfancontrol_state *state, int temp_mc)
+{
+	int threshold_mc = failsafe_temp * 1000;
+	int clear_mc = (failsafe_temp - failsafe_hyst) * 1000;
+
+	if (!READ_ONCE(state->failsafe_engaged) && temp_mc >= threshold_mc) {
+		int ret;
+
+		mutex_lock(&state->request_lock);
+		ret = ec_set_overrides(state, TARGET_AUTOMATIC, TARGET_AUTOMATIC);
+		if (!ret)
+			state->cur_state = NVFANCONTROL_RELEASE_STATE;
+		mutex_unlock(&state->request_lock);
+
+		WRITE_ONCE(state->failsafe_engaged, true);
+		dev_crit(&state->fdev->dev,
+			 "FAILSAFE: temp %d.%03dC >= %dC, released EC overrides%s\n",
+			 temp_mc / 1000, temp_mc % 1000, failsafe_temp,
+			 ret ? " (release write itself failed; EC state uncertain)" : "");
+	} else if (READ_ONCE(state->failsafe_engaged) && temp_mc < clear_mc) {
+		WRITE_ONCE(state->failsafe_engaged, false);
+		dev_warn(&state->fdev->dev,
+			 "failsafe cleared: temp %d.%03dC < %dC, kernel control re-engaging\n",
+			 temp_mc / 1000, temp_mc % 1000,
+			 failsafe_temp - failsafe_hyst);
+	}
+}
+
+static acpi_status nvfancontrol_acpi_thermal_found(acpi_handle handle, u32 level,
+						     void *context, void **return_value)
+{
+	struct nvfancontrol_state *state = context;
+
+	if (state->acpi_thermal_handle_count >=
+	    ARRAY_SIZE(state->acpi_thermal_handles))
+		return AE_CTRL_TERMINATE;
+
+	state->acpi_thermal_handles[state->acpi_thermal_handle_count++] = handle;
+
+	return AE_OK;
+}
+
+/* Walk the ACPI namespace for ThermalZone objects once; cache the handles. */
+static int nvfancontrol_resolve_acpi_thermal(struct nvfancontrol_state *state)
+{
+	acpi_status status;
+
+	if (state->acpi_thermal_resolved)
+		return state->acpi_thermal_handle_count ? 0 : -ENODEV;
+
+	status = acpi_walk_namespace(ACPI_TYPE_THERMAL, ACPI_ROOT_OBJECT,
+				      ACPI_UINT32_MAX,
+				      nvfancontrol_acpi_thermal_found, NULL,
+				      state, NULL);
+	state->acpi_thermal_resolved = true;
+
+	if (state->acpi_thermal_handle_count == 0) {
+		dev_err(&state->fdev->dev,
+			"acpi_walk_namespace(ACPI_TYPE_THERMAL) found no ThermalZone objects (status=%#x)\n",
+			status);
+		return -ENODEV;
+	}
+
+	dev_info(&state->fdev->dev,
+		 "resolved %u ACPI ThermalZone object(s) for temperature (max of _TMP across all)\n",
+		 state->acpi_thermal_handle_count);
+
+	return 0;
+}
+
+/*
+ * Reads _TMP directly on every ACPI ThermalZone object found on this
+ * platform and returns the max, in millidegrees C. No FF-A transaction;
+ * only actual fan-setpoint changes touch the EC mailbox. This is the same
+ * ACPICA call drivers/acpi/thermal.c itself makes internally -- concurrent
+ * _TMP evaluation from multiple callers is safe, ACPICA serializes it.
+ */
+static int nvfancontrol_get_temp(struct thermal_zone_device *tz, int *temp)
+{
+	struct nvfancontrol_state *state = thermal_zone_device_priv(tz);
+	int max_mc = INT_MIN;
+	unsigned int i, valid = 0;
+	int ret;
+
+	ret = nvfancontrol_resolve_acpi_thermal(state);
+	if (ret)
+		return ret;
+
+	for (i = 0; i < state->acpi_thermal_handle_count; i++) {
+		unsigned long long decikelvin;
+		acpi_status status;
+		int mc;
+
+		status = acpi_evaluate_integer(state->acpi_thermal_handles[i],
+						"_TMP", NULL, &decikelvin);
+		if (ACPI_FAILURE(status))
+			continue;
+
+		/* _TMP is in tenths of Kelvin; millidegrees C = dK*100 - 273150. */
+		mc = (int)decikelvin * 100 - 273150;
+		if (mc > max_mc)
+			max_mc = mc;
+		valid++;
+	}
+
+	if (!valid)
+		return -EIO;
+
+	*temp = max_mc;
+
+	nvfancontrol_failsafe_check(state, *temp);
+
+	return 0;
+}
+
+static bool nvfancontrol_should_bind(struct thermal_zone_device *tz,
+				      const struct thermal_trip *trip,
+				      struct thermal_cooling_device *cdev,
+				      struct cooling_spec *cspec)
+{
+	struct nvfancontrol_state *state = thermal_zone_device_priv(tz);
+	unsigned long target;
+
+	if (cdev != state->cdev)
+		return false;
+
+	target = (unsigned long)THERMAL_TRIP_PRIV_TO_INT(trip->priv);
+	cspec->upper = target;
+	cspec->lower = target;
+	cspec->weight = 0;
+
+	return true;
+}
+
+static int nvfancontrol_change_mode(struct thermal_zone_device *tz,
+				     enum thermal_device_mode mode)
+{
+	struct nvfancontrol_state *state = thermal_zone_device_priv(tz);
+
+	if (mode == THERMAL_DEVICE_DISABLED) {
+		nvfancontrol_release(state, "thermal zone disabled");
+		WRITE_ONCE(state->tz_enabled, false);
+	} else {
+		WRITE_ONCE(state->tz_enabled, true);
+	}
+
+	return 0;
+}
+
+static const struct thermal_zone_device_ops nvfancontrol_tz_ops = {
+	.get_temp = nvfancontrol_get_temp,
+	.should_bind = nvfancontrol_should_bind,
+	.change_mode = nvfancontrol_change_mode,
+};
+
+/* Read fan1's control-domain range once (caps cmd 1); cached thereafter. */
+static int ensure_ranges(struct nvfancontrol_state *state)
+{
+	u8 reply[THERMAL_CAPS_REPLY_LENGTH];
+	int ret;
+
+	if (state->ranges_valid)
+		return 0;
+
+	ret = ec_thermal_request(state, THERMAL_QUERY_CAPS, NULL, 0, reply,
+				  sizeof(reply));
+	if (ret)
+		return ret;
+
+	state->fan1_min = get_unaligned_le16(&reply[THERMAL_CAPS_FAN1_MIN_OFFSET]);
+	state->fan1_max = get_unaligned_le16(&reply[THERMAL_CAPS_FAN1_MAX_OFFSET]);
+	state->ranges_valid = true;
+
+	return 0;
+}
+
+/*
+ * Linearly interpolate a pinned state's EC curve percentage over fan1's
+ * control-domain range. Phase A verification (2026-08-27) found this
+ * control-domain value does not equal the real measured fan_rpm 1:1 on
+ * this unit (fan_rpm converged to a value proportional to, but well above,
+ * a near-max pinned value) -- that's expected and doesn't matter here,
+ * since this writes the same kind of value the EC's own curve would.
+ */
+static u16 state_pin_value(const struct nvfancontrol_state *state,
+			    unsigned long pin_state)
+{
+	u32 pct = nvfancontrol_curve_pct[pin_state];
+	u32 span = state->fan1_max - state->fan1_min;
+
+	return (u16)(state->fan1_min + DIV_ROUND_CLOSEST(pct * span, 100U));
+}
+
+static int nvfancontrol_apply_state(struct nvfancontrol_state *state,
+				     unsigned long new_state)
+{
+	u16 low, high;
+	int ret;
+
+	if (new_state == NVFANCONTROL_RELEASE_STATE) {
+		low = TARGET_AUTOMATIC;
+		high = TARGET_AUTOMATIC;
+	} else {
+		ret = ensure_ranges(state);
+		if (ret)
+			return ret;
+		low = high = state_pin_value(state, new_state);
+	}
+
+	return ec_set_overrides(state, low, high);
+}
+
+static int nvfancontrol_set_cur_state(struct thermal_cooling_device *cdev,
+				       unsigned long new_state)
+{
+	struct nvfancontrol_state *state = cdev->devdata;
+	bool disable_needed = false;
+	int ret;
+
+	if (new_state > NVFANCONTROL_RELEASE_STATE)
+		return -EINVAL;
+
+	if (READ_ONCE(state->failsafe_engaged))
+		new_state = NVFANCONTROL_RELEASE_STATE;
+
+	mutex_lock(&state->request_lock);
+
+	if (new_state == state->cur_state) {
+		mutex_unlock(&state->request_lock);
+		return 0;
+	}
+
+	ret = nvfancontrol_apply_state(state, new_state);
+	if (ret) {
+		state->override_fail_count++;
+		dev_crit(&state->fdev->dev,
+			 "cooling state %lu -> %lu failed: ret=%d (consecutive failures=%u/%u)\n",
+			 state->cur_state, new_state, ret,
+			 state->override_fail_count,
+			 (unsigned int)override_fail_limit);
+		if (state->override_fail_count >= override_fail_limit)
+			disable_needed = true;
+	} else {
+		dev_info(&state->fdev->dev, "cooling state %lu -> %lu\n",
+			 state->cur_state, new_state);
+		state->cur_state = new_state;
+		state->override_fail_count = 0;
+	}
+
+	mutex_unlock(&state->request_lock);
+
+	/*
+	 * Disabling must happen outside request_lock: thermal_zone_device_
+	 * disable() synchronously calls change_mode(), which takes
+	 * request_lock itself.
+	 */
+	if (disable_needed) {
+		dev_crit(&state->fdev->dev,
+			 "%u consecutive override-write failures; disabling thermal zone\n",
+			 (unsigned int)override_fail_limit);
+		thermal_zone_device_disable(state->tz);
+	}
+
+	return ret;
+}
+
+static int nvfancontrol_get_max_state(struct thermal_cooling_device *cdev,
+				       unsigned long *st)
+{
+	*st = NVFANCONTROL_RELEASE_STATE;
+	return 0;
+}
+
+static int nvfancontrol_get_cur_state(struct thermal_cooling_device *cdev,
+				       unsigned long *st)
+{
+	struct nvfancontrol_state *state = cdev->devdata;
+
+	*st = READ_ONCE(state->cur_state);
+	return 0;
+}
+
+static const struct thermal_cooling_device_ops nvfancontrol_cdev_ops = {
+	.get_max_state = nvfancontrol_get_max_state,
+	.get_cur_state = nvfancontrol_get_cur_state,
+	.set_cur_state = nvfancontrol_set_cur_state,
+};
+
+/*
+ * Trips mirror the EC's own curve levels above idle (state 0, 30%, is
+ * simply "below trip 0"). priv encodes the pinned state each trip's upper
+ * edge drives (should_bind() reads it back), so should_bind() doesn't need
+ * to do pointer arithmetic against this array.
+ */
+static const struct thermal_trip nvfancontrol_trips[NVFANCONTROL_NUM_TRIPS] = {
+	{ .temperature = 75000, .hysteresis = 10000, .type = THERMAL_TRIP_ACTIVE,
+	  .flags = THERMAL_TRIP_FLAG_RW, .priv = THERMAL_INT_TO_TRIP_PRIV(1) },
+	{ .temperature = 89000, .hysteresis = 10000, .type = THERMAL_TRIP_ACTIVE,
+	  .flags = THERMAL_TRIP_FLAG_RW, .priv = THERMAL_INT_TO_TRIP_PRIV(2) },
+	{ .temperature = 95000, .hysteresis = 20000, .type = THERMAL_TRIP_ACTIVE,
+	  .flags = THERMAL_TRIP_FLAG_RW, .priv = THERMAL_INT_TO_TRIP_PRIV(3) },
+	{ .temperature = 96000, .hysteresis = 20000, .type = THERMAL_TRIP_ACTIVE,
+	  .flags = THERMAL_TRIP_FLAG_RW, .priv = THERMAL_INT_TO_TRIP_PRIV(4) },
+};
+
+static const struct thermal_zone_params nvfancontrol_tzp = {
+	.governor_name = "step_wise",
+	.no_hwmon = true,
+};
 
 static ssize_t fan_show(struct device *dev, struct device_attribute *attr,
 			char *buf)
@@ -386,6 +865,12 @@ static ssize_t fan_store(struct device *dev, struct device_attribute *attr,
 	} else {
 		dev_err(dev, "fan accepts only 'max' or 'auto'\n");
 		return -EINVAL;
+	}
+
+	if (READ_ONCE(state->tz_enabled)) {
+		dev_err(dev,
+			"fan is busy: the nvfancontrol_ec thermal zone is enabled and owns both override slots; disable it first\n");
+		return -EBUSY;
 	}
 
 	ret = mutex_lock_interruptible(&state->request_lock);
@@ -577,7 +1062,51 @@ static ssize_t fan_override_show(struct device *dev,
 			   high == TARGET_AUTOMATIC ? " disabled" : "");
 }
 
-static DEVICE_ATTR_RO(fan_override);
+/*
+ * Testing-only direct override write, ahead of the thermal-zone/cooling-
+ * device integration that will normally own these slots. Accepts
+ * "<low> <high>" (each decimal or 0x-prefixed hex, 0-65535); writing the
+ * same value to both pins the fan target there (see ec_set_overrides()).
+ */
+static ssize_t fan_override_store(struct device *dev,
+				   struct device_attribute *attr,
+				   const char *buf, size_t count)
+{
+	struct nvfancontrol_state *state = dev_get_drvdata(dev);
+	unsigned int low_val, high_val;
+	int ret;
+
+	if (sscanf(buf, "%i %i", &low_val, &high_val) != 2 ||
+	    low_val > U16_MAX || high_val > U16_MAX) {
+		dev_err(dev,
+			"fan_override accepts \"<low> <high>\" (decimal or 0x.., each 0-65535)\n");
+		return -EINVAL;
+	}
+
+	if (READ_ONCE(state->tz_enabled)) {
+		dev_err(dev,
+			"fan_override is busy: the nvfancontrol_ec thermal zone is enabled and owns both override slots; disable it first\n");
+		return -EBUSY;
+	}
+
+	ret = mutex_lock_interruptible(&state->request_lock);
+	if (ret)
+		return ret;
+
+	ret = ec_set_overrides(state, (u16)low_val, (u16)high_val);
+
+	mutex_unlock(&state->request_lock);
+
+	if (ret)
+		return ret;
+
+	dev_warn(dev, "fan_override manually set: low=%#06x(%u) high=%#06x(%u)\n",
+		 low_val, low_val, high_val, high_val);
+
+	return count;
+}
+
+static DEVICE_ATTR_RW(fan_override);
 
 static int fan_override_probe(struct ffa_device *fdev)
 {
@@ -656,11 +1185,48 @@ static int fan_override_probe(struct ffa_device *fdev)
 		goto err_remove_fan_override;
 	}
 
+	state->reboot_nb.notifier_call = nvfancontrol_reboot_notify;
+	ret = register_reboot_notifier(&state->reboot_nb);
+	if (ret) {
+		dev_err(&fdev->dev, "failed to register reboot notifier: %d\n",
+			ret);
+		goto err_remove_fan_limits;
+	}
+
+	state->cdev = thermal_cooling_device_register("nvfancontrol_fan", state,
+						       &nvfancontrol_cdev_ops);
+	if (IS_ERR(state->cdev)) {
+		ret = PTR_ERR(state->cdev);
+		state->cdev = NULL;
+		dev_err(&fdev->dev, "failed to register cooling device: %d\n",
+			ret);
+		goto err_unregister_reboot;
+	}
+
+	state->tz = thermal_zone_device_register_with_trips(
+			"nvfancontrol_ec", nvfancontrol_trips,
+			NVFANCONTROL_NUM_TRIPS, state, &nvfancontrol_tz_ops,
+			&nvfancontrol_tzp, 0, 2000);
+	if (IS_ERR(state->tz)) {
+		ret = PTR_ERR(state->tz);
+		state->tz = NULL;
+		dev_err(&fdev->dev, "failed to register thermal zone: %d\n",
+			ret);
+		goto err_unregister_cdev;
+	}
+
 	dev_info(&fdev->dev,
-		 "sysfs control ready: %s/fan accepts 'max' or 'auto'; fan_caps, fan_limits, fan_telemetry, fan_rpm, fan_override are read-only; module load issued no EC request\n",
+		 "sysfs control ready: %s/fan accepts 'max' or 'auto'; fan_caps, fan_limits, fan_telemetry, fan_rpm are read-only, fan_override is writable for testing; nvfancontrol_ec thermal zone registered but disabled (write 'enabled' to its sysfs mode to start kernel fan control); module load issued no EC request\n",
 		 dev_name(&fdev->dev));
 	return 0;
 
+err_unregister_cdev:
+	thermal_cooling_device_unregister(state->cdev);
+	state->cdev = NULL;
+err_unregister_reboot:
+	unregister_reboot_notifier(&state->reboot_nb);
+err_remove_fan_limits:
+	device_remove_file(&fdev->dev, &dev_attr_fan_limits);
 err_remove_fan_override:
 	device_remove_file(&fdev->dev, &dev_attr_fan_override);
 err_remove_fan_rpm:
@@ -676,6 +1242,21 @@ err_remove_fan:
 
 static void fan_override_remove(struct ffa_device *fdev)
 {
+	struct nvfancontrol_state *state = dev_get_drvdata(&fdev->dev);
+
+	if (state->tz) {
+		/*
+		 * Disabling (if currently enabled) synchronously calls
+		 * change_mode(DISABLED), which releases the overrides;
+		 * a no-op if the zone was never enabled.
+		 */
+		thermal_zone_device_disable(state->tz);
+		thermal_zone_device_unregister(state->tz);
+	}
+	if (state->cdev)
+		thermal_cooling_device_unregister(state->cdev);
+	unregister_reboot_notifier(&state->reboot_nb);
+
 	device_remove_file(&fdev->dev, &dev_attr_fan_limits);
 	device_remove_file(&fdev->dev, &dev_attr_fan_override);
 	device_remove_file(&fdev->dev, &dev_attr_fan_rpm);
@@ -683,7 +1264,7 @@ static void fan_override_remove(struct ffa_device *fdev)
 	device_remove_file(&fdev->dev, &dev_attr_fan_caps);
 	device_remove_file(&fdev->dev, &dev_attr_fan);
 	dev_warn(&fdev->dev,
-		 "module removed; unloading does NOT change the EC override value\n");
+		 "module removed; the thermal zone's overrides (if it was enabled) were released; unloading otherwise does NOT change the EC override value\n");
 }
 
 static const struct ffa_device_id fan_override_ids[] = {
