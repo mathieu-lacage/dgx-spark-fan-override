@@ -5,7 +5,7 @@ set -eu
 PATH=/usr/sbin:/usr/bin:/sbin:/bin
 
 module='nvfancontrol'
-module_version='1.0.0'
+module_version='1.1.0'
 source_dir="/usr/src/$module"
 dkms_source_link="/usr/src/$module-$module_version"
 

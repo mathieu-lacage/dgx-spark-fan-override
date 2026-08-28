@@ -3,8 +3,9 @@ Description=nvfancontrol
 After=auditd.service
 
 [Service]
-ExecStart=/usr/sbin/nvfancontrol max
-Type=simple
+ExecStart=/usr/sbin/nvfancontrol enable
+Type=oneshot
+RemainAfterExit=yes
 
 [Install]
 WantedBy=multi-user.target
