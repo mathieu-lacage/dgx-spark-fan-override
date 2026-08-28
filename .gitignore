@@ -16,3 +16,6 @@ nvfancontrol/scripts/gpu_burn_gemm
 nvfancontrol/scripts/gpu_burn.cu
 nvfancontrol/scripts/gpu_burn_gemm.cu
 nvfancontrol/scripts/thermal_ceiling_test.sh
+
+# Built .deb packages
+*.deb
