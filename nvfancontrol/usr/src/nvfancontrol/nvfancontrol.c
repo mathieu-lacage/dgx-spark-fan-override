@@ -168,9 +168,16 @@ module_param(override_fail_limit, int, 0644);
 MODULE_PARM_DESC(override_fail_limit,
 		 "Consecutive EC override-write failures before disabling the thermal zone (default 3)");
 
-/* EC curve percentages for pinned states 0..4 (30/40/54/75/100%). */
+/*
+ * EC curve percentages for pinned states 0..4 (14/40/54/75/100%). State 0
+ * was calibrated on 2026-08-28 by sweeping fan1 override values with the
+ * thermal zone disabled and reading back real fan_rpm: pct 13-15 (control
+ * values 1586-1630 against this unit's fan1_min=1300/fan1_max=3500) all
+ * landed in the same ~2030-2080 RPM plateau, matching the ~2059 RPM this
+ * unit idled at natively before the kernel thermal zone took over state 0.
+ */
 static const u8 nvfancontrol_curve_pct[NVFANCONTROL_NUM_PIN_STATES] = {
-	30, 40, 54, 75, 100
+	14, 40, 54, 75, 100
 };
 
 enum nvfancontrol_fan_state {
@@ -805,7 +812,7 @@ static const struct thermal_cooling_device_ops nvfancontrol_cdev_ops = {
 };
 
 /*
- * Trips mirror the EC's own curve levels, including idle (state 0, 30%).
+ * Trips mirror the EC's own curve levels, including idle (state 0, 14%).
  * priv encodes the pinned state each trip drives (should_bind() reads it
  * back), so should_bind() doesn't need to do pointer arithmetic against
  * this array.
