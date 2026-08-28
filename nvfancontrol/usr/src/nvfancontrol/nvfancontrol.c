@@ -142,13 +142,12 @@
 
 /*
  * Kernel thermal-zone/cooling-device integration. Five pinned states
- * (0..4) mirror the EC's own 5-level curve percentages; a 6th state
- * releases both override slots back to the EC's native curve. Each of
- * the 4 trips below drives the transition into one pinned state above
- * idle (state 0 is simply "below the lowest trip").
+ * (0..4) mirror the EC's own 5-level curve percentages, each driven by
+ * its own trip point (including state 0, the idle/30C stage); a 6th
+ * state releases both override slots back to the EC's native curve.
  */
 #define NVFANCONTROL_NUM_PIN_STATES  5U
-#define NVFANCONTROL_NUM_TRIPS       (NVFANCONTROL_NUM_PIN_STATES - 1U)
+#define NVFANCONTROL_NUM_TRIPS       NVFANCONTROL_NUM_PIN_STATES
 #define NVFANCONTROL_RELEASE_STATE   NVFANCONTROL_NUM_PIN_STATES
 
 /* Upper bound on ACPI ThermalZone objects to track (7 observed on this platform). */
@@ -800,12 +799,14 @@ static const struct thermal_cooling_device_ops nvfancontrol_cdev_ops = {
 };
 
 /*
- * Trips mirror the EC's own curve levels above idle (state 0, 30%, is
- * simply "below trip 0"). priv encodes the pinned state each trip's upper
- * edge drives (should_bind() reads it back), so should_bind() doesn't need
- * to do pointer arithmetic against this array.
+ * Trips mirror the EC's own curve levels, including idle (state 0, 30%).
+ * priv encodes the pinned state each trip drives (should_bind() reads it
+ * back), so should_bind() doesn't need to do pointer arithmetic against
+ * this array.
  */
 static const struct thermal_trip nvfancontrol_trips[NVFANCONTROL_NUM_TRIPS] = {
+	{ .temperature = 30000, .hysteresis = 15000, .type = THERMAL_TRIP_ACTIVE,
+	  .flags = THERMAL_TRIP_FLAG_RW, .priv = THERMAL_INT_TO_TRIP_PRIV(0) },
 	{ .temperature = 75000, .hysteresis = 10000, .type = THERMAL_TRIP_ACTIVE,
 	  .flags = THERMAL_TRIP_FLAG_RW, .priv = THERMAL_INT_TO_TRIP_PRIV(1) },
 	{ .temperature = 89000, .hysteresis = 10000, .type = THERMAL_TRIP_ACTIVE,

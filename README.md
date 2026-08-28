@@ -120,11 +120,13 @@ fan1: 13500 = 13500 -> RPM 转换函数返回 100%
 加载模块时两者都会被注册，但温控区保持 **disabled** 状态——这与上文"加载不发出 EC 请求"的约定一致。在向该温控区的 `mode` 属性写入 `enabled` 之前，任何行为都不会改变：
 
 ```text
-echo enabled > /sys/class/thermal/thermal_zoneX/mode   # 内核调速器接管
+echo enabled > /sys/class/thermal/thermal_zoneX/mode   # 内核调速器开始接管
 echo disabled > /sys/class/thermal/thermal_zoneX/mode  # 将两个槽释放回 EC（0xFFFF/0xFFFF）
 ```
 
-启用后，内核的 `step_wise` 调速器会根据 4 个触发点（trip）驱动制冷设备的 6 个状态（0-4 为钳位状态，5 为释放），这些触发点**默认近似 EC 自身的曲线**（75/89/95/96 °C，回滞 10/10/20/20 °C——最后一级从最初的 98 °C 调整为 96 °C，因为一次满载热压测试显示 EC 原生曲线实际在约 95-96 °C 就跳到了 100% 档位，而非 98 °C）——因此启用后在未经调优前变化很小，可通过该温控区的标准 sysfs 接口调优：
+写入 `enabled` 本身不会立即触发任何 EC 请求——它只是让 `step_wise` 调速器开始按轮询周期评估温度；真正的 EC 覆盖写入，要等到当前温度跨过某个触发点时才会发生。若启用时温度已经低于最低触发点，两个覆盖槽会保持写入前的原值（通常仍是 `0xFFFF/0xFFFF`），此时风扇转速完全由 EC 自身的原生曲线决定，`cooling_deviceY/cur_state` 会读到 `0`。
+
+启用后，内核的 `step_wise` 调速器会根据 5 个触发点（trip）驱动制冷设备的 6 个状态（0-4 为钳位状态，各自对应一个触发点；5 为释放），这些触发点**默认近似 EC 自身的曲线**（30/75/89/95/96 °C，回滞 15/10/10/20/20 °C——最后一级从最初的 98 °C 调整为 96 °C，因为一次满载热压测试显示 EC 原生曲线实际在约 95-96 °C 就跳到了 100% 档位，而非 98 °C）——因此启用后在未经调优前变化很小，可通过该温控区的标准 sysfs 接口调优：
 
 ```text
 cat  /sys/class/thermal/thermal_zoneX/trip_point_0_temp

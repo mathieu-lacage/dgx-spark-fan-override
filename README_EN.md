@@ -118,11 +118,13 @@ Writing the same value to both override slots pins the fan target exactly there 
 Loading the module registers both but leaves the zone **disabled** — consistent with the "no EC request at load" invariant. Nothing changes until you write `enabled` to the zone's `mode` attribute:
 
 ```text
-echo enabled > /sys/class/thermal/thermal_zoneX/mode   # kernel governor takes over
+echo enabled > /sys/class/thermal/thermal_zoneX/mode   # kernel governor starts taking over
 echo disabled > /sys/class/thermal/thermal_zoneX/mode  # releases both slots back to the EC (0xFFFF/0xFFFF)
 ```
 
-While enabled, the kernel's `step_wise` governor drives the cooling device's 6 states (0-4 pinned, 5 = release) from 4 trips that **default to approximating the EC's own curve** (75/89/95/96 °C, hysteresis 10/10/20/20 °C — the last figure adjusted from an initial 98 °C to 96 °C after a thermal-ceiling stress test showed the real EC curve jumping to its 100% state around 95-96 °C, not 98 °C) — so enabling it changes little until you tune it via the zone's standard sysfs:
+Writing `enabled` by itself issues no EC request — it only starts the `step_wise` governor polling temperature; the actual EC override write happens only once the current temperature crosses a trip point. If the zone is enabled while already below the lowest trip, both override slots stay at whatever they were before (typically still `0xFFFF/0xFFFF`), fan speed is entirely up to the EC's own native curve, and `cooling_deviceY/cur_state` reads `0`.
+
+While enabled, the kernel's `step_wise` governor drives the cooling device's 6 states (0-4 pinned, one per trip; 5 = release) from 5 trips that **default to approximating the EC's own curve** (30/75/89/95/96 °C, hysteresis 15/10/10/20/20 °C — the last figure adjusted from an initial 98 °C to 96 °C after a thermal-ceiling stress test showed the real EC curve jumping to its 100% state around 95-96 °C, not 98 °C) — so enabling it changes little until you tune it via the zone's standard sysfs:
 
 ```text
 cat  /sys/class/thermal/thermal_zoneX/trip_point_0_temp
