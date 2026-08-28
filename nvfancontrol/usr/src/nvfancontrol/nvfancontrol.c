@@ -206,6 +206,7 @@ struct nvfancontrol_state {
 	bool tz_enabled;
 	bool failsafe_engaged;
 	unsigned long cur_state;
+	bool state_applied;
 	unsigned int override_fail_count;
 
 	bool ranges_valid;
@@ -478,8 +479,10 @@ static void nvfancontrol_release(struct nvfancontrol_state *state, const char *w
 
 	mutex_lock(&state->request_lock);
 	ret = ec_set_overrides(state, TARGET_AUTOMATIC, TARGET_AUTOMATIC);
-	if (!ret)
+	if (!ret) {
 		state->cur_state = NVFANCONTROL_RELEASE_STATE;
+		state->state_applied = true;
+	}
 	mutex_unlock(&state->request_lock);
 
 	if (ret)
@@ -520,8 +523,10 @@ static void nvfancontrol_failsafe_check(struct nvfancontrol_state *state, int te
 
 		mutex_lock(&state->request_lock);
 		ret = ec_set_overrides(state, TARGET_AUTOMATIC, TARGET_AUTOMATIC);
-		if (!ret)
+		if (!ret) {
 			state->cur_state = NVFANCONTROL_RELEASE_STATE;
+			state->state_applied = true;
+		}
 		mutex_unlock(&state->request_lock);
 
 		WRITE_ONCE(state->failsafe_engaged, true);
@@ -737,7 +742,7 @@ static int nvfancontrol_set_cur_state(struct thermal_cooling_device *cdev,
 
 	mutex_lock(&state->request_lock);
 
-	if (new_state == state->cur_state) {
+	if (new_state == state->cur_state && state->state_applied) {
 		mutex_unlock(&state->request_lock);
 		return 0;
 	}
@@ -756,6 +761,7 @@ static int nvfancontrol_set_cur_state(struct thermal_cooling_device *cdev,
 		dev_info(&state->fdev->dev, "cooling state %lu -> %lu\n",
 			 state->cur_state, new_state);
 		state->cur_state = new_state;
+		state->state_applied = true;
 		state->override_fail_count = 0;
 	}
 
